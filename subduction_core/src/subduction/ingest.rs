@@ -63,6 +63,21 @@ impl Ingested {
     }
 }
 
+/// What a batch sync response contributed to the local sedimentree: the heads
+/// of the newly inserted commits and fragments, plus the wire-form items for
+/// `ingested`.
+///
+/// The two are not interchangeable. `ingested` is what the caller must push on
+/// to its own subscribers ([`peers::build_pushes`](super::peers::build_pushes)),
+/// while `commit_ids`/`fragment_ids` are recorded as the ids of this response;
+/// a head cannot be read back off a [`Signed`] payload without a fallible
+/// decode, so it is captured while the verified payload is in hand.
+#[derive(Debug, Default)]
+pub(crate) struct IngestSummary {
+    pub(crate) commit_ids: Vec<CommitId>,
+    pub(crate) fragment_ids: Vec<CommitId>,
+    pub(crate) ingested: Ingested,
+}
 /// Process an incoming batch sync response: verify and store all commits
 /// and fragments from the diff. Returns the items not already present in the
 /// minimized local tree; the rest are written idempotently but not reported,
@@ -83,7 +98,7 @@ pub(crate) async fn recv_batch_sync_response<
     from: &PeerId,
     id: SedimentreeId,
     diff: SyncDiff,
-) -> Result<Ingested, IoError<Async, Store, Conn, WireMsg>> {
+) -> Result<IngestSummary, IoError<Async, Store, Conn, WireMsg>> {
     tracing::info!(
         tree = ?id,
         peer = %from,
@@ -98,6 +113,7 @@ pub(crate) async fn recv_batch_sync_response<
     // so we can call save_batch once per author instead of once per item.
     let mut commits_by_author: Map<PeerId, Vec<VerifiedMeta<LooseCommit>>> = Map::new();
     let mut fragments_by_author: Map<PeerId, Vec<VerifiedMeta<Fragment>>> = Map::new();
+    let mut summary = IngestSummary::default();
 
     for (signed_commit, blob) in diff.missing_commits {
         let verified = match signed_commit.try_verify() {
@@ -207,7 +223,6 @@ pub(crate) async fn recv_batch_sync_response<
         .copied()
         .collect();
 
-    let mut ingested = Ingested::default();
     for author_id in all_authors {
         let Some(putter) = putter_cache.get(&author_id) else {
             tracing::warn!(author = %author_id, "putter for author unexpectedly missing from cache");
@@ -247,18 +262,30 @@ pub(crate) async fn recv_batch_sync_response<
             .map_err(IoError::Storage)?
             .unwrap_or_default();
 
-        ingested.commits.extend(
-            commits
-                .iter()
-                .filter(|v| seen_commits.insert(v.payload().head()))
-                .map(|v| (v.signed().clone(), v.blob().clone())),
-        );
-        ingested.fragments.extend(
-            fragments
-                .iter()
-                .filter(|v| seen_fragments.insert(v.payload().head()))
-                .map(|v| (v.signed().clone(), v.blob().clone())),
-        );
+        // The ids of the newly inserted items and their wire form are captured
+        // in the same pass: `seen_*.insert` is the single source of truth for
+        // "new to this tree", and the wire form cannot supply the head back
+        // (recovering one from a [`Signed`] payload is a fallible decode).
+        for v in &commits {
+            let head = v.payload().head();
+            if seen_commits.insert(head) {
+                summary.commit_ids.push(head);
+                summary
+                    .ingested
+                    .commits
+                    .push((v.signed().clone(), v.blob().clone()));
+            }
+        }
+        for v in &fragments {
+            let head = v.payload().head();
+            if seen_fragments.insert(head) {
+                summary.fragment_ids.push(head);
+                summary
+                    .ingested
+                    .fragments
+                    .push((v.signed().clone(), v.blob().clone()));
+            }
+        }
         let commit_payloads: Vec<LooseCommit> =
             commits.iter().map(|v| v.payload().clone()).collect();
         let fragment_payloads: Vec<Fragment> =
@@ -292,7 +319,7 @@ pub(crate) async fn recv_batch_sync_response<
         }
     }
 
-    Ok(ingested)
+    Ok(summary)
 }
 
 /// Insert a verified commit into storage and the in-memory tree.

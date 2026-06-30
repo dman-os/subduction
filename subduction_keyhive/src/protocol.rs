@@ -549,6 +549,12 @@ where
                 peer = %peer,
                 "sync check passed, peers are in sync"
             );
+            let confirmation = Message::SyncConfirmation {
+                sender_id: self.peer_id.clone(),
+                target_id: peer.clone(),
+                confirmer_total: our_total,
+            };
+            self.sign_and_send(peer, confirmation, false).await?;
         } else {
             tracing::debug!(
                 peer = %peer,
@@ -3024,10 +3030,18 @@ mod tests {
             .await
             .expect("bob failed to handle sync check");
 
-        // In-sync means no fallback SyncRequest was sent
+        let confirmation = alice_conn
+            .inbound_rx
+            .try_recv()
+            .expect("in-sync check should receive sync confirmation");
+        let status = alice_proto
+            .handle_message(&bob_id, confirmation, None)
+            .await
+            .expect("alice failed to handle sync confirmation");
+        assert_eq!(status, SyncStatus::Done);
         assert!(
             alice_conn.inbound_rx.try_recv().is_err(),
-            "no outbound messages expected when peers are in sync"
+            "only a sync confirmation should be sent when peers are in sync"
         );
     }
 
@@ -3170,6 +3184,19 @@ mod tests {
             .await
             .expect("resolve_sync_check");
 
+        let confirmation = bob_conn
+            .inbound_rx
+            .try_recv()
+            .expect("in-sync resolve should send sync confirmation");
+        let verified = confirmation
+            .verify(&alice_proto.peer_id)
+            .expect("verify sync confirmation");
+        let message: Message =
+            cbor_deserialize(&verified.payload).expect("decode sync confirmation");
+        assert!(
+            matches!(message, Message::SyncConfirmation { .. }),
+            "in-sync resolve should send sync confirmation, got {message:?}"
+        );
         assert!(
             bob_conn.inbound_rx.try_recv().is_err(),
             "no fallback expected when counts and digest match"
@@ -4134,10 +4161,19 @@ mod protocol_behavioural {
             .await
             .expect("handle_message sync check");
 
+        let confirmation = bob_conn
+            .inbound_rx
+            .try_recv()
+            .expect("in-sync check should receive sync confirmation");
+        let status = bob_proto
+            .handle_message(&alice_id, confirmation, None)
+            .await
+            .expect("handle sync confirmation");
+        assert_eq!(status, SyncStatus::Done);
         let alice_messages = drain_channel(&bob_conn, &alice_id);
         assert!(
             alice_messages.is_empty(),
-            "expected no outbound messages (in-sync), got {alice_messages:?}"
+            "expected no additional outbound messages after sync confirmation, got {alice_messages:?}"
         );
     }
 

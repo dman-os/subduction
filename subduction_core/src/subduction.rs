@@ -2291,10 +2291,6 @@ where
                             continue;
                         }
                     };
-                    // Track counts for stats
-                    let commits_to_receive = missing_commits.len();
-                    let fragments_to_receive = missing_fragments.len();
-
                     // Ingest in one batched pass: `recv_batch_sync_response` groups
                     // items by author and writes each batch in a single `save_batch`.
                     // `requesting` is handled separately below, so the ingester's
@@ -2320,13 +2316,13 @@ where
                     self.minimize_tree(id).await;
                     self.push_to_subscribers(id, to_ask, &ingest_summary.ingested).await;
 
-                    // Update received stats (count what was offered, not verified)
-                    stats.commits_received += commits_to_receive;
-                    stats.fragments_received += fragments_to_receive;
+                    stats.commits_received += session.received_commit_ids.len();
+                    stats.fragments_received += session.received_fragment_ids.len();
 
                     tracing::debug!(
                         tree = ?id,
-                        commits_received = commits_to_receive,
+                        commits_received = session.received_commit_ids.len(),
+                        fragments_received = session.received_fragment_ids.len(),
                         requesting_commits = requesting.commit_fingerprints.len(),
                         requesting_fragments = requesting.fragment_fingerprints.len(),
                         "received response"
@@ -2533,19 +2529,6 @@ where
                                     }
                                 };
 
-                                // Track counts for stats
-                                let commits_to_receive = missing_commits.len();
-                                let fragments_to_receive = missing_fragments.len();
-
-                                tracing::debug!(
-                                    sedimentree_id = ?id,
-                                    commits_received = commits_to_receive,
-                                    fragments_received = fragments_to_receive,
-                                    peer_requesting_commits = requesting.commit_fingerprints.len(),
-                                    peer_requesting_fragments = requesting.fragment_fingerprints.len(),
-                                    "sync_with_all_peers: response received"
-                                );
-
                                 // Ingest in one batched pass; see `sync_with_peer`.
                                 // `requesting` is handled separately below.
                                 let ingest_summary = ingest::recv_batch_sync_response(
@@ -2567,9 +2550,17 @@ where
                                 self.minimize_tree(id).await;
                                 self.push_to_subscribers(id, peer_id, &ingest_summary.ingested).await;
 
-                                // Update received stats
-                                stats.commits_received += commits_to_receive;
-                                stats.fragments_received += fragments_to_receive;
+                                stats.commits_received += session.received_commit_ids.len();
+                                stats.fragments_received += session.received_fragment_ids.len();
+
+                                tracing::debug!(
+                                    sedimentree_id = ?id,
+                                    commits_received = session.received_commit_ids.len(),
+                                    fragments_received = session.received_fragment_ids.len(),
+                                    peer_requesting_commits = requesting.commit_fingerprints.len(),
+                                    peer_requesting_fragments = requesting.fragment_fingerprints.len(),
+                                    "sync_with_all_peers: response received"
+                                );
 
                                 // Send back data the responder requested (bidirectional sync)
                                 if !requesting.is_empty() {

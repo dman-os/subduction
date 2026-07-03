@@ -64,20 +64,42 @@ impl Ingested {
 }
 
 /// What a batch sync response contributed to the local sedimentree: the heads
-/// of the newly inserted commits and fragments, plus the wire-form items for
-/// `ingested`.
+/// of the newly inserted commits and fragments, the wire-form items for
+/// `ingested`, and the ids the storage policy rejected.
 ///
-/// The two are not interchangeable. `ingested` is what the caller must push on
-/// to its own subscribers ([`peers::build_pushes`](super::peers::build_pushes)),
-/// while `commit_ids`/`fragment_ids` are recorded as the ids of this response;
-/// a head cannot be read back off a [`Signed`] payload without a fallible
-/// decode, so it is captured while the verified payload is in hand.
-#[derive(Debug, Default)]
-pub(crate) struct IngestSummary {
+/// `ingested` and `commit_ids`/`fragment_ids` are not interchangeable.
+/// `ingested` is what the caller pushes on to its own subscribers
+/// ([`peers::build_pushes`](super::peers::build_pushes)); a head cannot be read
+/// back off a [`Signed`] payload without a fallible decode, so the ids are
+/// captured while the verified payload is in hand.
+#[derive(Debug)]
+pub(crate) struct IngestSummary<Rejection> {
     pub(crate) commit_ids: Vec<CommitId>,
     pub(crate) fragment_ids: Vec<CommitId>,
     pub(crate) ingested: Ingested,
+    pub(crate) rejected_commit_ids: Vec<(CommitId, Rejection)>,
+    pub(crate) rejected_fragment_ids: Vec<(CommitId, Rejection)>,
 }
+
+impl<Rejection> IngestSummary<Rejection> {
+    #[must_use]
+    pub(crate) fn new() -> Self {
+        Self {
+            commit_ids: Vec::new(),
+            fragment_ids: Vec::new(),
+            ingested: Ingested::default(),
+            rejected_commit_ids: Vec::new(),
+            rejected_fragment_ids: Vec::new(),
+        }
+    }
+}
+
+impl<Rejection> Default for IngestSummary<Rejection> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Process an incoming batch sync response: verify and store all commits
 /// and fragments from the diff. Returns the items not already present in the
 /// minimized local tree; the rest are written idempotently but not reported,
@@ -98,7 +120,7 @@ pub(crate) async fn recv_batch_sync_response<
     from: &PeerId,
     id: SedimentreeId,
     diff: SyncDiff,
-) -> Result<IngestSummary, IoError<Async, Store, Conn, WireMsg>> {
+) -> Result<IngestSummary<Auth::PutDisallowed>, IoError<Async, Store, Conn, WireMsg>> {
     tracing::info!(
         tree = ?id,
         peer = %from,
@@ -134,6 +156,7 @@ pub(crate) async fn recv_batch_sync_response<
             }
         };
 
+        let commit_id = verified_meta.payload().head();
         let author = verified_meta.verified_author();
         let author_id = PeerId::from(*author.verifying_key());
 
@@ -151,6 +174,7 @@ pub(crate) async fn recv_batch_sync_response<
                         error = %e,
                         "policy rejected commit"
                     );
+                    summary.rejected_commit_ids.push((commit_id, e));
                     continue;
                 }
             }
@@ -184,6 +208,7 @@ pub(crate) async fn recv_batch_sync_response<
             }
         };
 
+        let fragment_id = verified_meta.payload().head();
         let author = verified_meta.verified_author();
         let author_id = PeerId::from(*author.verifying_key());
 
@@ -201,6 +226,7 @@ pub(crate) async fn recv_batch_sync_response<
                         error = %e,
                         "policy rejected fragment"
                     );
+                    summary.rejected_fragment_ids.push((fragment_id, e));
                     continue;
                 }
             }

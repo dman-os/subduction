@@ -558,6 +558,9 @@ impl<
                         tracing::debug!(peer = %from, tree = ?id, "peer reports we are unauthorized for sedimentree");
                         None
                     }
+                    SyncResult::PolicyRejected(kind) => {
+                        tracing::debug!(peer = %from, tree = ?id, ?kind, "peer reports a structured policy rejection for sedimentree");
+                    }
                 }
             }
             SyncMessage::RemoveSubscriptions(crate::connection::message::RemoveSubscriptions {
@@ -874,7 +877,11 @@ impl<
         #[cfg(feature = "metrics")]
         self.requestor_tally.record(peer_id).await;
 
-        let mut session = SyncSession::new(id, peer_id, SyncSessionKind::InboundBatch);
+        let mut session = SyncSession::new(
+            id,
+            peer_id,
+            SyncSessionKind::InboundBatch { request_id: req_id },
+        );
         let fetcher = match self.storage.get_fetcher::<Async>(peer_id, id).await {
             Ok(f) => f,
             Err(e) => {
@@ -887,7 +894,9 @@ impl<
                 let msg: SyncMessage = BatchSyncResponse {
                     id,
                     req_id,
-                    result: SyncResult::Unauthorized,
+                    result: SyncResult::PolicyRejected(
+                        self.storage.policy().classify_fetch_rejection(&e),
+                    ),
                     responder_heads: RemoteHeads::default(),
                 }
                 .into();
@@ -1210,11 +1219,11 @@ impl<
         id: SedimentreeId,
         diff: SyncDiff,
     ) -> Result<Option<FanOut<Conn, Async>>, IoError<Async, Store, Conn, SyncMessage>> {
-        let ingested =
+        let ingest_summary =
             ingest::recv_batch_sync_response(&self.sedimentrees, &self.storage, from, id, diff)
                 .await?;
         self.minimize_tree(id).await;
-        if ingested.is_empty() {
+        if ingest_summary.ingested.is_empty() {
             return Ok(None);
         }
         let conns = self.get_authorized_subscriber_conns(id, from).await;
@@ -1223,7 +1232,8 @@ impl<
         }
 
         let heads = self.heads_for(id).await;
-        let pushes = peers::build_pushes(id, &heads, &self.send_counter, &conns, &ingested).await;
+        let pushes =
+            peers::build_pushes(id, &heads, &self.send_counter, &conns, &ingest_summary.ingested).await;
         Ok(Some(FanOut { ack: None, pushes }))
     }
 

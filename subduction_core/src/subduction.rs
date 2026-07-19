@@ -93,7 +93,7 @@ use crate::{
     sync_session::{DynSyncSessionObserver, SyncPolicyRejection, SyncSession, SyncSessionKind},
     timeout::{Timeout, call::CallTimeout},
 };
-use alloc::{collections::BTreeSet, sync::Arc, vec::Vec};
+use alloc::{collections::BTreeSet, string::ToString, sync::Arc, vec::Vec};
 use async_channel::{Sender, bounded};
 use async_lock::{Mutex, SemaphoreGuardArc};
 use core::{marker::PhantomData, time::Duration};
@@ -1165,10 +1165,6 @@ where
                         }
                         SyncResult::Unauthorized => {
                             tracing::debug!(peer = %conn.peer_id(), tree = ?id, "peer reports we are unauthorized for sedimentree");
-                            continue;
-                        }
-                        SyncResult::PolicyRejected(kind) => {
-                            tracing::debug!(peer = %conn.peer_id(), tree = ?id, ?kind, "peer reports a structured policy rejection for sedimentree");
                             continue;
                         }
                     };
@@ -2306,14 +2302,6 @@ where
                             self.emit_sync_session(session).await;
                             continue;
                         }
-                        SyncResult::PolicyRejected(kind) => {
-                            tracing::debug!(peer = %to_ask, tree = ?id, ?kind, "peer reports a structured policy rejection for sedimentree");
-                            session.remote_rejection =
-                                Some(crate::sync_session::SyncRemoteRejection::Policy(kind));
-                            stats.remote_rejection = session.remote_rejection;
-                            self.emit_sync_session(session).await;
-                            continue;
-                        }
                     };
                     // Ingest in one batched pass: `recv_batch_sync_response` groups
                     // items by author and writes each batch in a single `save_batch`.
@@ -2337,9 +2325,8 @@ where
                     session
                         .received_fragment_ids
                         .extend(ingest_summary.fragment_ids);
-                    session
-                        .rejected_commit_ids
-                        .extend(ingest_summary.rejected_commit_ids.into_iter().map(
+                    session.rejected_commit_ids.extend(
+                        ingest_summary.rejected_commit_ids.into_iter().map(
                             |(commit_id, rejection)| {
                                 (
                                     commit_id,
@@ -2349,10 +2336,10 @@ where
                                     ),
                                 )
                             },
-                        ));
-                    session
-                        .rejected_fragment_ids
-                        .extend(ingest_summary.rejected_fragment_ids.into_iter().map(
+                        ),
+                    );
+                    session.rejected_fragment_ids.extend(
+                        ingest_summary.rejected_fragment_ids.into_iter().map(
                             |(fragment_id, rejection)| {
                                 (
                                     fragment_id,
@@ -2362,7 +2349,20 @@ where
                                     ),
                                 )
                             },
-                        ));
+                        ),
+                    );
+                    stats.local_policy_rejections.extend(
+                        session
+                            .rejected_commit_ids
+                            .iter()
+                            .map(|(_, rejection)| rejection.clone())
+                            .chain(
+                                session
+                                    .rejected_fragment_ids
+                                    .iter()
+                                    .map(|(_, rejection)| rejection.clone()),
+                            ),
+                    );
                     self.minimize_tree(id).await;
                     self.push_to_subscribers(id, to_ask, &ingest_summary.ingested).await;
 
@@ -2584,15 +2584,6 @@ where
                                         tracing::debug!(peer = %peer_id, tree = ?id, "peer reports we are unauthorized for sedimentree");
                                         session.remote_rejection = Some(
                                             crate::sync_session::SyncRemoteRejection::Unauthorized,
-                                        );
-                                        stats.remote_rejection = session.remote_rejection;
-                                        self.emit_sync_session(session).await;
-                                        continue;
-                                    }
-                                    SyncResult::PolicyRejected(kind) => {
-                                        tracing::debug!(peer = %peer_id, tree = ?id, ?kind, "peer reports a structured policy rejection for sedimentree");
-                                        session.remote_rejection = Some(
-                                            crate::sync_session::SyncRemoteRejection::Policy(kind),
                                         );
                                         stats.remote_rejection = session.remote_rejection;
                                         self.emit_sync_session(session).await;

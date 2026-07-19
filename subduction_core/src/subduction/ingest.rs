@@ -400,6 +400,12 @@ pub(crate) async fn insert_commit_locally<
             },
         )
         .await?;
+    tracing::debug!(
+        sedimentree_id = ?id,
+        commit_id = ?head,
+        was_added,
+        "inserted local loose commit into resident sedimentree",
+    );
 
     Ok(was_added)
 }

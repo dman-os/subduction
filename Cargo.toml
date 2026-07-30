@@ -297,3 +297,8 @@ opt-level = 2
 
 [profile.wasm-debug.package.sedimentree_core]
 opt-level = 2
+
+# [patch."https://github.com/dman-os/keyhive"]
+# keyhive_crypto = { path = "../keyhive/keyhive_crypto" }
+# keyhive_core = { path = "../keyhive/keyhive_core" }
+# beekem = { path = "../keyhive/beekem" }

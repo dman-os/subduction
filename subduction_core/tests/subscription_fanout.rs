@@ -232,7 +232,7 @@ async fn add_commit_without_subscribers_pushes_nothing() -> TestResult {
     );
 
     // Positive control.
-    b.sync_with_peer(&PeerId::from(a_s.verifying_key()), id, true, SYNC_TIMEOUT)
+    b.sync_with_peer(&PeerId::from(a_s.verifying_key()), id, true, SYNC_TIMEOUT, None)
         .await?;
     assert!(
         wait_until(|| async { commit_count(&b, id).await == 1 }).await,
@@ -264,7 +264,7 @@ async fn add_fragment_without_subscribers_pushes_nothing() -> TestResult {
     );
 
     // Positive control.
-    b.sync_with_peer(&PeerId::from(a_s.verifying_key()), id, true, SYNC_TIMEOUT)
+    b.sync_with_peer(&PeerId::from(a_s.verifying_key()), id, true, SYNC_TIMEOUT, None)
         .await?;
     assert!(
         wait_until(|| async { fragment_count(&b, id).await == 1 }).await,
@@ -295,8 +295,8 @@ async fn add_commit_pushes_only_to_authorized_subscribers() -> TestResult {
     // Both subscribe. A records both subscriptions (that happens before the
     // fetch-policy check); C's request is answered `Unauthorized`, which
     // `sync_with_peer` reports as `Ok((false, ..))`, not an error.
-    b.sync_with_peer(&a_peer, id, true, SYNC_TIMEOUT).await?;
-    c.sync_with_peer(&a_peer, id, true, SYNC_TIMEOUT).await?;
+    b.sync_with_peer(&a_peer, id, true, SYNC_TIMEOUT, None).await?;
+    c.sync_with_peer(&a_peer, id, true, SYNC_TIMEOUT, None).await?;
     assert!(
         wait_until(|| async {
             let subs = a.get_subscribers(id).await;
@@ -431,8 +431,8 @@ async fn requester_pulled_data_is_pushed_only_to_authorized_subscribers() -> Tes
 
     // Both subscribe on R. R has nothing yet, propagates upstream to B, and
     // pulls X in the response.
-    a.sync_with_peer(&r_peer, id, true, SYNC_TIMEOUT).await?;
-    drop(c.sync_with_peer(&r_peer, id, true, SYNC_TIMEOUT).await);
+    a.sync_with_peer(&r_peer, id, true, SYNC_TIMEOUT, None).await?;
+    drop(c.sync_with_peer(&r_peer, id, true, SYNC_TIMEOUT, None).await);
 
     assert!(
         wait_until(|| async { commit_count(&r, id).await == 1 }).await,

@@ -38,7 +38,7 @@ async fn wedged_subscriber_does_not_block_relay_sync() -> TestResult {
     // A subscribes to X on R while nobody has X yet, so R records A as a
     // subscriber (and propagates upstream, which finds nothing).
     let x = SedimentreeId::new([9u8; 32]);
-    a.sync_with_peer(&r_peer, x, true, SYNC_TIMEOUT).await?;
+    a.sync_with_peer(&r_peer, x, true, SYNC_TIMEOUT, None).await?;
     assert!(r.get_subscribers(x).await.contains(&a_peer));
 
     // R's sends to A now park forever: A is byte-connected but wedged.
@@ -48,7 +48,7 @@ async fn wedged_subscriber_does_not_block_relay_sync() -> TestResult {
     // that push must not hold R's sync round open.
     b.store_commit(x, make_head(1), BTreeSet::new(), make_blob(1))
         .await?;
-    let round = tokio::time::timeout(BOUND, r.sync_with_peer(&b_peer, x, true, SYNC_TIMEOUT)).await;
+    let round = tokio::time::timeout(BOUND, r.sync_with_peer(&b_peer, x, true, SYNC_TIMEOUT, None)).await;
     assert!(
         round.is_ok(),
         "sync_with_peer did not return within {BOUND:?}; a parked subscriber send is blocking it"
@@ -73,7 +73,7 @@ async fn wedged_subscriber_does_not_block_sync_with_all_peers() -> TestResult {
     tokio::time::sleep(Duration::from_millis(20)).await;
 
     let x = SedimentreeId::new([10u8; 32]);
-    a.sync_with_peer(&r_peer, x, true, SYNC_TIMEOUT).await?;
+    a.sync_with_peer(&r_peer, x, true, SYNC_TIMEOUT, None).await?;
     r_to_a.pause();
 
     b.store_commit(x, make_head(1), BTreeSet::new(), make_blob(1))

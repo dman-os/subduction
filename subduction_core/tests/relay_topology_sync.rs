@@ -199,7 +199,7 @@ async fn relay_topology_converges_on_initial_sync() -> TestResult {
     // A subscribes via R (the automerge-repo write path: store, then
     // `sync_with_all_peers(subscribe = true)`). The 1.5-RTT exchange
     // carries the commit to R.
-    a.sync_with_peer(&r_peer, sed_id, true, SYNC_TIMEOUT)
+    a.sync_with_peer(&r_peer, sed_id, true, SYNC_TIMEOUT, None)
         .await?;
     assert!(
         wait_until(|| {
@@ -213,7 +213,7 @@ async fn relay_topology_converges_on_initial_sync() -> TestResult {
     // B has no sedimentree yet, so `full_sync_with_all_peers` (which
     // iterates B's known sedimentrees) is a no-op for this id. Force a
     // per-id sync to subscribe B and pull the data.
-    b.sync_with_peer(&r_peer, sed_id, true, SYNC_TIMEOUT)
+    b.sync_with_peer(&r_peer, sed_id, true, SYNC_TIMEOUT, None)
         .await?;
     assert!(
         wait_until(|| {
@@ -319,7 +319,7 @@ async fn relay_topology_propagates_subscriptions_upstream() -> TestResult {
 
     // A subscribes to R for `sed_id` (R has no data yet).
     let r_peer = PeerId::from(r_signer.verifying_key());
-    a.sync_with_peer(&r_peer, sed_id, true, SYNC_TIMEOUT)
+    a.sync_with_peer(&r_peer, sed_id, true, SYNC_TIMEOUT, None)
         .await?;
 
     // R propagates to B; poll until the subscription is recorded.
@@ -498,9 +498,9 @@ async fn relay_topology_two_clients_add_built_batch_converge_via_relay() -> Test
     let sed_id = SedimentreeId::new([15u8; 32]);
 
     let r_peer = PeerId::from(make_signer(20).verifying_key());
-    a.sync_with_peer(&r_peer, sed_id, true, SYNC_TIMEOUT)
+    a.sync_with_peer(&r_peer, sed_id, true, SYNC_TIMEOUT, None)
         .await?;
-    b.sync_with_peer(&r_peer, sed_id, true, SYNC_TIMEOUT)
+    b.sync_with_peer(&r_peer, sed_id, true, SYNC_TIMEOUT, None)
         .await?;
     tokio::time::sleep(PROPAGATION_PAUSE).await;
 
@@ -1063,7 +1063,7 @@ async fn relay_drops_outgoing_claims_on_peer_disconnect() -> TestResult {
     let b_peer = PeerId::from(b_signer.verifying_key());
 
     // A subscribes to R; R propagates upstream to B and claims (B, id).
-    a.sync_with_peer(&r_peer, sed_id, true, SYNC_TIMEOUT)
+    a.sync_with_peer(&r_peer, sed_id, true, SYNC_TIMEOUT, None)
         .await?;
     let established = wait_until(|| {
         let r = Arc::clone(&r);
@@ -1104,7 +1104,7 @@ async fn relay_repropagates_subscription_after_peer_reconnect() -> TestResult {
     let b_peer = PeerId::from(b_signer.verifying_key());
 
     // Establish: A subscribes to R; R propagates to B.
-    a.sync_with_peer(&r_peer, sed_id, true, SYNC_TIMEOUT)
+    a.sync_with_peer(&r_peer, sed_id, true, SYNC_TIMEOUT, None)
         .await?;
     let established = wait_until(|| {
         let r = Arc::clone(&r);
@@ -1125,7 +1125,7 @@ async fn relay_repropagates_subscription_after_peer_reconnect() -> TestResult {
     connect_pair(&r, &r_signer, &b, &b_signer).await?;
 
     // A re-subscribes; R must re-propagate to the reconnected B.
-    a.sync_with_peer(&r_peer, sed_id, true, SYNC_TIMEOUT)
+    a.sync_with_peer(&r_peer, sed_id, true, SYNC_TIMEOUT, None)
         .await?;
     let reestablished = wait_until(|| {
         let r = Arc::clone(&r);

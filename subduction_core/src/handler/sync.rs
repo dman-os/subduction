@@ -861,7 +861,7 @@ impl<
         Ok(fanout)
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines, clippy::expect_used)]
     async fn recv_batch_sync_request(
         &self,
         id: SedimentreeId,

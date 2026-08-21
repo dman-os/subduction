@@ -2920,7 +2920,7 @@ dependencies = [
 [[package]]
 name = "keyhive_crypto"
 version = "0.2.1"
-source = "git+https://github.com/dman-os/keyhive?rev=65ef136008e4b1a839b2f20bf59548bec858ddd8#65ef136008e4b1a839b2f20bf59548bec858ddd8"
+source = "git+https://github.com/dman-os/keyhive?rev=ec8aa7f0cdb24fb355bd5f0d1cc29bde04c9960d#ec8aa7f0cdb24fb355bd5f0d1cc29bde04c9960d"
 dependencies = [
  "bincode",
  "blake3",
@@ -5590,6 +5590,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

@@ -2920,7 +2920,7 @@ dependencies = [
 [[package]]
 name = "keyhive_crypto"
 version = "0.2.1"
-source = "git+https://github.com/dman-os/keyhive?rev=ec8aa7f0cdb24fb355bd5f0d1cc29bde04c9960d#ec8aa7f0cdb24fb355bd5f0d1cc29bde04c9960d"
+source = "git+https://github.com/dman-os/keyhive?rev=f53929d91bd177fec50bf2e7436d8ae5ba7021f8#f53929d91bd177fec50bf2e7436d8ae5ba7021f8"
 dependencies = [
  "bincode",
  "blake3",

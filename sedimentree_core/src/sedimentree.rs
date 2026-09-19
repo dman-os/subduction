@@ -1279,9 +1279,18 @@ mod tests {
         // A is missing the extra commits (what B has that A doesn't)
         assert_eq!(diff.left_missing_commits.len(), 2);
         // B is missing nothing
-        assert!(diff.right_missing_commits.is_empty());
-        assert!(diff.left_missing_fragments.is_empty());
-        assert!(diff.right_missing_fragments.is_empty());
+        assert!(
+            diff.right_missing_commits.is_empty(),
+            "B has every commit A has"
+        );
+        assert!(
+            diff.left_missing_fragments.is_empty(),
+            "A has every fragment B has"
+        );
+        assert!(
+            diff.right_missing_fragments.is_empty(),
+            "B has every fragment A has"
+        );
     }
 
     #[test]
@@ -1298,9 +1307,18 @@ mod tests {
         // A is missing the extra fragment
         assert_eq!(diff.left_missing_fragments.len(), 1);
         // B is missing nothing
-        assert!(diff.right_missing_fragments.is_empty());
-        assert!(diff.left_missing_commits.is_empty());
-        assert!(diff.right_missing_commits.is_empty());
+        assert!(
+            diff.right_missing_fragments.is_empty(),
+            "B has every fragment A has"
+        );
+        assert!(
+            diff.left_missing_commits.is_empty(),
+            "A has every commit B has"
+        );
+        assert!(
+            diff.right_missing_commits.is_empty(),
+            "B has every commit A has"
+        );
     }
 
     #[test]

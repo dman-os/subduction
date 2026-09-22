@@ -323,7 +323,11 @@ fn missing_fragment_internal_bridge_converges_by_spilling_residue() {
     let mut actual_heads = compact.heads(&metric);
     actual_heads.sort_unstable();
     assert_eq!(actual_heads, expected_heads);
-    assert_eq!(incomplete.heads(&metric), compact.heads(&metric));
+    // `heads` is set-valued — under `std` it is a `HashSet` iteration order —
+    // so the two frontiers are compared as sets, not as sequences.
+    let mut incomplete_heads = incomplete.heads(&metric);
+    incomplete_heads.sort_unstable();
+    assert_eq!(incomplete_heads, actual_heads);
 }
 
 /// **Critical correctness case**: server has loose P → B → H (P is

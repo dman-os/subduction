@@ -1093,9 +1093,11 @@ impl Sedimentree {
         // - Loose commit IDs which are not referenced by another commit or fragment
         // - Fragment head IDs which are not referenced by another commit or fragment
         //
-        // "referenced by another commit or fragment" means that the ID is
-        // either in the parent set of a commit, in the boundary set of a
-        // fragment, or in the checkpoint set of a fragment.
+        // A reference by another commit or fragment is: a commit's parent set,
+        // a fragment's boundary set, or a fragment's checkpoint set. A
+        // fragment's own checkpoint entries are the one exception: they are
+        // self-reference, not coverage, so they cannot hide that fragment's own
+        // head.
         //
         // We compute this set by first collecting all referenced IDs, then iterating
         // over the fragment heads and loose commits to find those which are not in the
@@ -1109,7 +1111,19 @@ impl Sedimentree {
         let mut referenced_checkpoints: Set<Checkpoint> = Set::new();
         for fragment in self.fragments.values() {
             referenced_ids.extend(fragment.boundary().iter().copied());
-            referenced_checkpoints.extend(fragment.checkpoints().iter().copied());
+            // A checkpoint is an external reference: a deeper fragment listing
+            // a shallower fragment's head does cover that head, so the head is
+            // not a frontier. A fragment's own head is the exception — filtering
+            // self-reference out of the frontier drops the fragment's tip
+            // whenever its head is also one of its own checkpoints.
+            let own_head = Checkpoint::new(fragment.head());
+            referenced_checkpoints.extend(
+                fragment
+                    .checkpoints()
+                    .iter()
+                    .filter(|checkpoint| **checkpoint != own_head)
+                    .copied(),
+            );
         }
 
         let heads: Set<CommitId> = self

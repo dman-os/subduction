@@ -253,7 +253,8 @@ async fn client_does_not_receive_documents_it_never_asked_for() -> TestResult {
     assert!(!has(&a, x).await, "A must not have X after B's later edit");
 
     // Positive control.
-    a.sync_with_peer(&s_peer, x, true, SYNC_TIMEOUT, None).await?;
+    a.sync_with_peer(&s_peer, x, true, SYNC_TIMEOUT, None)
+        .await?;
     assert!(
         wait_until(|| async { a.get_commits(x).await.map(|c| c.len()) == Some(2) }).await,
         "once A asks for X it receives it"
@@ -283,7 +284,8 @@ async fn relay_forwards_data_it_pulled_from_upstream() -> TestResult {
 
     // A asks R for X. R has nothing, propagates upstream to B, pulls X in
     // the response, and must forward it to A.
-    a.sync_with_peer(&r_peer, x, true, SYNC_TIMEOUT, None).await?;
+    a.sync_with_peer(&r_peer, x, true, SYNC_TIMEOUT, None)
+        .await?;
     assert!(wait_until(|| has(&r, x)).await, "R should pull X from B");
     assert!(
         wait_until(|| has(&a, x)).await,
@@ -381,7 +383,8 @@ async fn relay_forwards_fragments_it_pulled_from_upstream() -> TestResult {
     )
     .await?;
 
-    a.sync_with_peer(&r_peer, x, true, SYNC_TIMEOUT, None).await?;
+    a.sync_with_peer(&r_peer, x, true, SYNC_TIMEOUT, None)
+        .await?;
     assert!(
         wait_until(|| has_fragment(&r, x)).await,
         "R should pull the fragment from B"
@@ -447,7 +450,8 @@ async fn already_known_items_are_not_re_pushed() -> TestResult {
     assert_eq!(pushes(0xE1).await, 1, "first pull pushes X to B once");
 
     // Second pull: the hub asks U again and gets the same X back.
-    hub.sync_with_peer(&up_peer, x, false, SYNC_TIMEOUT, None).await?;
+    hub.sync_with_peer(&up_peer, x, false, SYNC_TIMEOUT, None)
+        .await?;
     assert_eq!(
         pushes(0xE2).await,
         0,

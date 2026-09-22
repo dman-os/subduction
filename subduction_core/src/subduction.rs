@@ -1882,7 +1882,8 @@ where
             ingest::recv_batch_sync_response(&self.sedimentrees, &self.storage, from, id, diff)
                 .await?;
         self.minimize_tree(id).await;
-        self.push_to_subscribers(id, from, &ingest_summary.ingested).await;
+        self.push_to_subscribers(id, from, &ingest_summary.ingested)
+            .await;
         Ok(())
     }
 
@@ -2478,7 +2479,8 @@ where
                             ),
                     );
                     self.minimize_tree(id).await;
-                    self.push_to_subscribers(id, to_ask, &ingest_summary.ingested).await;
+                    self.push_to_subscribers(id, to_ask, &ingest_summary.ingested)
+                        .await;
 
                     stats.commits_received += session.received_commit_ids.len();
                     stats.fragments_received += session.received_fragment_ids.len();

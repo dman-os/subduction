@@ -1256,8 +1256,14 @@ impl<
         }
 
         let heads = self.heads_for(id).await;
-        let pushes =
-            peers::build_pushes(id, &heads, &self.send_counter, &conns, &ingest_summary.ingested).await;
+        let pushes = peers::build_pushes(
+            id,
+            &heads,
+            &self.send_counter,
+            &conns,
+            &ingest_summary.ingested,
+        )
+        .await;
         Ok(Some(FanOut { ack: None, pushes }))
     }
 

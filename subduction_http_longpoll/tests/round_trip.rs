@@ -521,10 +521,7 @@ async fn large_message_handling() -> TestResult {
         .get_commits(sed_id)
         .await
         .expect("server should have commits");
-    assert!(
-        !server_commits.is_empty(),
-        "server should hold the synced commits"
-    );
+    assert!(!server_commits.is_empty());
 
     // Verify blob data is intact on server
     let server_blobs = server

@@ -35,7 +35,7 @@ use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use futures::executor::block_on;
 use keyhive_core::{
     access::Access,
-    principal::{identifier::Identifier, public::Public},
+    principal::{identifier::Identifier, membered::Membered, public::Public},
 };
 use nonempty::nonempty;
 use subduction_keyhive::{
@@ -105,14 +105,22 @@ async fn build(n: usize, shape: Shape) -> (TestProtocol, Sizes) {
     // N docs owned by the server, shared per `shape`.
     for i in 0..n {
         let fill = ((i % 251) + 1) as u8;
-        let doc_id = server
+        let doc = server
             .generate_doc(vec![], nonempty![[fill; 32]])
             .await
             .expect("generate_doc");
+        // `generate_doc` yields the id; `Membered::Document` also needs the live handle.
+        let doc_id = doc;
+        let doc = server
+            .get_document(doc_id)
+            .await
+            .expect("generated document is present");
+        let membered = Membered::Document(doc_id, doc);
         match shape {
             Shape::Public => {
+                let public_agent = Public;
                 server
-                    .add_member(Public.id(), doc_id, Access::Read, &[])
+                    .add_member(public_agent.id(), membered.membered_id(), Access::Read, &[])
                     .await
                     .expect("add_member public");
             }
@@ -127,9 +135,9 @@ async fn build(n: usize, shape: Shape) -> (TestProtocol, Sizes) {
                         continue;
                     }
                     let id: Identifier = peers[j].id().into();
-                    if server.get_agent(id).await.is_some() {
+                    if let Some(agent) = server.get_agent(id).await {
                         server
-                            .add_member(id, doc_id, Access::Read, &[])
+                            .add_member(agent.id(), membered.membered_id(), Access::Read, &[])
                             .await
                             .expect("add_member peer");
                     }
@@ -176,14 +184,26 @@ async fn build_synced(n: usize) -> (TestProtocol, Sizes) {
     // Each peer owns a doc, makes it public, and grants the server relay (Read).
     for (i, p) in peer_khs.iter().enumerate() {
         let fill = ((i % 251) + 1) as u8;
-        let doc_id = p
+        let doc = p
             .generate_doc(vec![], nonempty![[fill; 32]])
             .await
             .expect("generate_doc");
-        p.add_member(Public.id(), doc_id, Access::Read, &[])
+        // `generate_doc` yields the id; `Membered::Document` also needs the live handle.
+        let doc_id = doc;
+        let doc = p
+            .get_document(doc_id)
+            .await
+            .expect("generated document is present");
+        let membered = Membered::Document(doc_id, doc);
+        let public_agent = Public;
+        p.add_member(public_agent.id(), membered.membered_id(), Access::Read, &[])
             .await
             .expect("add public");
-        p.add_member(server_identifier, doc_id, Access::Read, &[])
+        let server_agent = p
+            .get_agent(server_identifier)
+            .await
+            .expect("server agent known to peer");
+        p.add_member(server_agent.id(), membered.membered_id(), Access::Read, &[])
             .await
             .expect("add server relay");
     }

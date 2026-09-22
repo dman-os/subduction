@@ -45,8 +45,11 @@ use keyhive_core::{
     keyhive::Keyhive,
     listener::membership::MembershipListener,
     principal::{
-        agent::Agent, group::membership_operation::MembershipOperation, identifier::Identifier,
-        individual::op::KeyOp, public::Public,
+        agent::Agent,
+        group::membership_operation::MembershipOperation,
+        identifier::Identifier,
+        individual::op::{AllReachablePrekeyOps, KeyOp},
+        public::Public,
     },
     store::ciphertext::{CiphertextStore, CiphertextStoreExt},
 };
@@ -57,7 +60,7 @@ use keyhive_crypto::{
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    cache::PeriodicEventCache,
+    cache::{PeerPairProjection, PeriodicEventCache},
     collections::{Map, Set},
     connection::KeyhiveConnection,
     error::{ProtocolError, SigningError, StorageError, VerificationError},
@@ -454,7 +457,8 @@ where
         // Phase 1: serialize every distinct op once, skipping hashes
         // the caller already has cached.
         let mut membership_source_hashes: BTreeMap<Identifier, Vec<EventHash>> = BTreeMap::new();
-        let mut delegate_ids_per_source: BTreeMap<Identifier, Vec<Identifier>> = BTreeMap::new();
+        let mut named_delegates_per_source: BTreeMap<Identifier, Vec<(EventHash, Identifier)>> =
+            BTreeMap::new();
         for (source_id, source_ops) in &all_membership.ops {
             let mut hashes = Vec::with_capacity(source_ops.len());
             let mut delegates = Vec::new();
@@ -462,7 +466,7 @@ where
                 let h = digest_to_bytes(digest);
                 hashes.push(h);
                 if let MembershipOperation::Delegation(dlg) = op {
-                    delegates.push(dlg.payload.delegate().id());
+                    delegates.push((h, dlg.payload.delegate().id()));
                 }
                 if !skip_serialization.contains(&h)
                     && let Entry::Vacant(e) = event_data.entry(h)
@@ -474,7 +478,7 @@ where
             }
             membership_source_hashes.insert(*source_id, hashes);
             if !delegates.is_empty() {
-                delegate_ids_per_source.insert(*source_id, delegates);
+                named_delegates_per_source.insert(*source_id, delegates);
             }
         }
 
@@ -506,20 +510,24 @@ where
         all_agent_ids.extend(all_prekey.index.keys().copied());
         all_agent_ids.extend(all_cgka.index.keys().copied());
 
-        // Phase 3: roll source-keyed hashes up to per-agent sets,
-        // including prekey ops for revoked delegates referenced by
-        // membership delegations.
-        let mut source_delegate_prekeys: BTreeMap<Identifier, BTreeSet<EventHash>> =
-            BTreeMap::new();
-        for (source_id, delegates) in &delegate_ids_per_source {
-            let mut combined = BTreeSet::new();
-            for delegate_id in delegates {
-                if let Some(ph) = prekey_source_hashes.get(delegate_id) {
-                    combined.extend(ph);
-                }
-            }
-            source_delegate_prekeys.insert(*source_id, combined);
-        }
+        // Phase 3: roll source-keyed hashes up to per-agent sets, closing each set over the key
+        // material its naming events require.
+        //
+        // A delegation is advertised together with the key material its delegate needs to be
+        // pickable (`pickable_individuals`), so a peer never records a counterparty it cannot
+        // co-sign with. The bytes stay in `event_data`: this decides what we tell a peer, not what
+        // we serve for a hash it already knows from elsewhere.
+        //
+        // Coverage is attached here and never enforced by withholding: a name is forwarded by
+        // nodes that may be unable to back it — a relay that learned a grant without ever
+        // holding the grantee's prekeys — and dropping the name at that hop stops membership
+        // from crossing it at all, which is the whole point of a relay. What closes the split is
+        // the attachment, on the node that does hold the material, together with
+        // `KeyOp::topsort` keeping a rotated individual's ops serializable so its holder can
+        // pass them on.
+        let closure =
+            reference_closure(&keyhive, &named_delegates_per_source, &prekey_source_hashes).await;
+        let source_delegate_prekeys = closure.attached_per_source;
 
         let mut agent_hashes: BTreeMap<KeyhivePeerId, BTreeSet<EventHash>> = BTreeMap::new();
         for agent_id in &all_agent_ids {
@@ -552,6 +560,23 @@ where
             let peer = KeyhivePeerId::from_identifier(agent_id);
             agent_hashes.insert(peer, hash_set);
         }
+
+        tracing::debug!(
+            keyhive_peer = %self.peer_id,
+            named_delegates = closure.named_delegates,
+            uncovered_naming_events = closure.uncovered_naming_events,
+            uncovered_delegates = ?closure.uncovered_delegates,
+            missing_individuals = ?closure.missing_individuals,
+            missing_registered_empty = closure.missing_registered_empty,
+            missing_unregistered = closure.missing_unregistered,
+            exempt_individuals_skipped = closure.exempt_individuals_skipped,
+            attached_prekey_hashes = source_delegate_prekeys
+                .values()
+                .map(BTreeSet::len)
+                .sum::<usize>(),
+            agents = agent_hashes.len(),
+            "INSTR selection reference closure (advertisement)"
+        );
 
         Ok(crate::all_agent_events::AllAgentEvents {
             agent_hashes,
@@ -600,9 +625,7 @@ where
                 Some(cached)
             } else {
                 match self.get_events_for_peer_pair(target_id).await {
-                    Ok(pair) => {
-                        pair.map(Arc::new)
-                    }
+                    Ok(pair) => pair.map(Arc::new),
                     Err(error) => {
                         tracing::warn!(
                             target = %target_id,
@@ -769,7 +792,8 @@ where
         let verified = signed_msg.verify(from)?;
 
         if let Some(contact_card) = &verified.contact_card {
-            self.ingest_contact_card(contact_card, Some(from.clone())).await?;
+            self.ingest_contact_card(contact_card, Some(from.clone()))
+                .await?;
         }
         if !self.has_peer(&verified.sender_id).await
             && let Some(connection) = conn.clone()
@@ -1076,7 +1100,8 @@ where
         let advanced = if found_events.is_empty() {
             false
         } else {
-            self.ingest_events(&found_events, Some(sender_id.clone())).await?
+            self.ingest_events(&found_events, Some(sender_id.clone()))
+                .await?
         };
         // TEMPORARY instrumentation
         {
@@ -1404,23 +1429,128 @@ where
         };
 
         let mut result = AgentHashMap::new();
+        // INSTR selection composition: prekey ops are advertised only through
+        // `reachable_prekey_ops_for_agent`, and whether they are selected is decided independently
+        // of the delegations that name the same individuals (which reach the peer through their
+        // own subject-root reachability). If delegations are selected while prekey ops are not, the
+        // receiver records membership for an agent it cannot co-sign with — a state with no causal
+        // parent, so nothing else in keyhive notices it.
+        {
+            let mut sent_prekeys = 0usize;
+            let mut sent_delegations = 0usize;
+            let mut local_prekeys = 0usize;
+            let mut peer_prekeys = 0usize;
+            for event in our_events.values() {
+                if matches!(
+                    event,
+                    StaticEvent::PrekeysExpanded(_) | StaticEvent::PrekeyRotated(_)
+                ) {
+                    local_prekeys += 1;
+                }
+            }
+            for event in their_events.values() {
+                if matches!(
+                    event,
+                    StaticEvent::PrekeysExpanded(_) | StaticEvent::PrekeyRotated(_)
+                ) {
+                    peer_prekeys += 1;
+                }
+            }
+            for (digest, event) in &our_events {
+                if !their_events.contains_key(digest) {
+                    continue;
+                }
+                if matches!(
+                    event,
+                    StaticEvent::PrekeysExpanded(_) | StaticEvent::PrekeyRotated(_)
+                ) {
+                    sent_prekeys += 1;
+                } else if matches!(event, StaticEvent::Delegated(_)) {
+                    sent_delegations += 1;
+                }
+            }
+            tracing::warn!(
+                sent_prekeys,
+                sent_delegations,
+                local_prekeys,
+                peer_prekeys,
+                public = public_events.len(),
+                "INSTR selection composition"
+            );
+        }
+
         for (digest, event) in public_events {
             let h = digest_to_bytes(&digest);
             let pair = serialize_event(&event)?;
             result.insert(h, pair);
         }
 
+        // Reference closure: an event that names an agent travels with that agent's key ops (see
+        // `close_references`).
+        self.close_references(&mut result, &our_events, &their_events)
+            .await?;
+
+        Ok(Some(result))
+    }
+
+    /// Close a selection over the key material its naming events require.
+    ///
+    /// An event that names an agent travels with that agent's key ops. The intersection that
+    /// selected the event computes reachability on the event's subject, while the agent's key ops
+    /// are reached through the container walk, so the two can be split; attaching the material here
+    /// closes that split, and reveals nothing extra, since the naming event already tells the peer
+    /// that the agent exists.
+    ///
+    /// Nothing is withheld: an intermediate node legitimately holds a name whose material it does
+    /// not have (the grant's author had the delegate's prekeys; a relay may have only learned the
+    /// grant), and dropping the name there would stop membership crossing that hop. See
+    /// `all_agent_events` for the same rule on the path that runs in practice.
+    async fn close_references(
+        &self,
+        result: &mut AgentHashMap,
+        our_events: &Map<Digest<StaticEvent<CRef>>, StaticEvent<CRef>>,
+        their_events: &Map<Digest<StaticEvent<CRef>>, StaticEvent<CRef>>,
+    ) -> Result<(), ProtocolError<Conn::SendError>> {
+        let named = named_agents(
+            our_events
+                .iter()
+                .filter(|(digest, _)| their_events.contains_key(digest))
+                .map(|(_, event)| event),
+        );
+        let keyhive = Arc::clone(&self.keyhive);
+        // One reachability pass for the whole exchange: deciding per named agent would re-walk every
+        // group's and document's transitive members once per delegation.
+        let reachable = keyhive.reachable_prekey_ops_for_all_agents().await;
+        let mut attachments: Vec<(Digest<StaticEvent<CRef>>, StaticEvent<CRef>)> = Vec::new();
+        for &agent in &named {
+            attachments.extend(prekey_closure_for_agent(keyhive.as_ref(), &reachable, agent).await);
+        }
+        let attached_count = attachments.len();
+
         for (digest, event) in our_events {
-            if their_events.contains_key(&digest) {
-                let h = digest_to_bytes(&digest);
-                if let Entry::Vacant(entry) = result.entry(h) {
-                    let pair = serialize_event(&event)?;
-                    entry.insert(pair);
-                }
+            if !their_events.contains_key(digest) {
+                continue;
+            }
+            let h = digest_to_bytes(digest);
+            if let Entry::Vacant(entry) = result.entry(h) {
+                entry.insert(serialize_event(event)?);
             }
         }
 
-        Ok(Some(result))
+        for (digest, event) in attachments {
+            let h = digest_to_bytes(&digest);
+            if let Entry::Vacant(entry) = result.entry(h) {
+                entry.insert(serialize_event(&event)?);
+            }
+        }
+
+        tracing::warn!(
+            named_agents = ?named,
+            attached_prekey_events = attached_count,
+            "INSTR selection reference closure"
+        );
+
+        Ok(())
     }
 
     /// Get pending event hashes as `Vec<EventHash>`.
@@ -1926,15 +2056,25 @@ where
         Ok(())
     }
 
-    /// Look up cached events for us paired with the provided peer
+    /// Look up cached events for us paired with the provided peer.
+    ///
+    /// `None` means the cache cannot answer for this peer: the local keyhive holds no
+    /// visible set for it at all, i.e. it has never seen it. That is the only reason this
+    /// declines. An empty set is returned as-is, because "we know the peer and there is
+    /// nothing to advertise" is a different fact from "we have never seen the peer", and
+    /// callers decide whether to ask for a contact card on exactly that difference. A
+    /// caller that receives `None` falls through to [`Self::get_events_for_peer_pair`],
+    /// which asks the keyhive directly and also answers `None` for an unknown peer.
     async fn cached_events_for_pair_with_peer(
         &self,
         peer: &KeyhivePeerId,
     ) -> Option<Arc<AgentHashMap>> {
         let cache = self.cache.lock().await;
         let local = self.peer_id();
-        let map = cache.events_for_peer_pair(&local, peer);
-        (!map.is_empty()).then_some(map)
+        match cache.events_for_peer_pair(&local, peer) {
+            PeerPairProjection::Unknown => None,
+            PeerPairProjection::Known { events } => Some(events),
+        }
     }
 
     /// Compute the per-pair total op count and a digest of the pair's op-hash
@@ -2080,9 +2220,12 @@ where
 
             // Publish exactly the generation observed before and after the
             // rebuild. Never label an older snapshot with a later generation.
-            self.snapshot_state_generation.store(before, Ordering::Release);
-            self.snapshot_nested_generation
-                .store(self.keyhive.nested_store_generation_sum().await, Ordering::Release);
+            self.snapshot_state_generation
+                .store(before, Ordering::Release);
+            self.snapshot_nested_generation.store(
+                self.keyhive.nested_store_generation_sum().await,
+                Ordering::Release,
+            );
             if self.keyhive.state_generation() == before {
                 return Ok(());
             }
@@ -2107,10 +2250,242 @@ where
     Rng: rand::CryptoRng + rand::RngCore,
 {
     keyhive
-        .static_events_for_agent(agent)
+        .static_events_for_agent(agent.id())
         .await
         .into_iter()
         .collect::<Map<Digest<StaticEvent<CRef>>, StaticEvent<CRef>>>()
+}
+
+/// The agents named by events the peer is about to receive.
+///
+/// Only delegations count: they add a principal the receiver may later have to act as the
+/// counterparty of. A revocation removes one instead (acting on a removal needs no key material),
+/// and prekey and CGKA events name no counterparty at all.
+fn named_agents<'a, CRef>(
+    events: impl Iterator<Item = &'a StaticEvent<CRef>>,
+) -> HashSet<Identifier>
+where
+    CRef: ContentRef + 'a,
+{
+    let mut named = HashSet::new();
+    for event in events {
+        if let StaticEvent::Delegated(delegation) = event {
+            named.insert(delegation.payload().delegate);
+        }
+    }
+    named
+}
+
+/// The individuals whose key ops must accompany an event naming `agent`.
+///
+/// Mirrors keyhive's `pick_individual_prekeys`: it walks the principal's transitive members,
+/// keeps the individuals at `Read` or better, and needs a published prekey for each of them. An
+/// individual is pickable directly, a group or document through the individuals flattened into its
+/// transitive members, and a group's or document's own entry is deliberately not part of the set
+/// because both routinely publish no prekey of their own. keyhive's walk skips nested groups and
+/// documents for the same reason: `transitive_members` is already transitive.
+///
+/// Both selection paths call this — the advertisement cache and the per-pair fallback — so that
+/// "who is pickable" has one definition rather than one per path.
+async fn pickable_individuals<Async, Signer, CRef, Plaintext, CipherStore, Listener, Rng>(
+    keyhive: &Keyhive<Async, Signer, CRef, Plaintext, CipherStore, Listener, Rng>,
+    agent: Identifier,
+) -> Vec<Identifier>
+where
+    Async: future_form::FutureForm,
+    Signer: AsyncSigner<Async> + Clone,
+    CRef: ContentRef,
+    Plaintext: for<'de> serde::Deserialize<'de>,
+    CipherStore: CiphertextStore<Async, CRef, Plaintext>
+        + CiphertextStoreExt<Async, CRef, Plaintext>
+        + Clone,
+    Listener: MembershipListener<Async, Signer, CRef>,
+    Rng: rand::CryptoRng + rand::RngCore,
+{
+    match keyhive.get_agent(agent).await.and_then(|a| a.as_membered()) {
+        Some(membered) => membered
+            .transitive_members()
+            .await
+            .into_iter()
+            .filter(|(_, (member, access))| {
+                access.is_reader() && matches!(member, Agent::Individual(..) | Agent::Active(..))
+            })
+            .map(|(id, _)| id)
+            .collect(),
+        None => vec![agent],
+    }
+}
+
+/// What one attachment pass over a round's named delegates attached, and what it could not.
+///
+/// The two `uncovered_*` counters are the diagnostic an operator reads to decide whether a
+/// "name without material" split occurred, so they report only delegates whose material is
+/// genuinely *absent*. A pick set holding nothing but `Public` has nothing to attach **by
+/// design** — `Public`'s key is well known and it publishes no prekey ops of its own — and a pick
+/// set with no individuals at all has nobody to co-sign with. Counting either as uncovered was a
+/// permanent false positive: any round naming `Public` reported an uncovered delegate, which made
+/// the counter unable to distinguish "a split occurred" from "the round mentioned `Public`".
+/// The exempt skips are counted separately, in `exempt_individuals_skipped`, so that work stays
+/// visible without being mislabelled as absent material.
+#[derive(Debug, Default)]
+struct ReferenceClosure {
+    /// Per naming source, the key ops of the delegates the named events need.
+    attached_per_source: BTreeMap<Identifier, BTreeSet<EventHash>>,
+    /// Naming events, across every delegate whose pick set was walked.
+    named_delegates: usize,
+    /// Delegates whose material was expected and absent.
+    uncovered_delegates: BTreeSet<Identifier>,
+    /// Naming events for those uncovered delegates.
+    uncovered_naming_events: usize,
+    /// Pickable individuals this node holds no material for.
+    missing_individuals: BTreeSet<Identifier>,
+    /// How many of those are registered but hold no key ops: a restore or a prune.
+    missing_registered_empty: usize,
+    /// How many of those never registered, so no op of theirs reached this node.
+    missing_unregistered: usize,
+    /// Pickable individuals skipped by design, whose key material is well known.
+    exempt_individuals_skipped: usize,
+}
+
+/// Close each named delegate's events over the key material a peer needs to co-sign with it.
+///
+/// Attachment is never conditional on covering the whole set: a name is forwarded by nodes that
+/// may be unable to back it (a relay that learned a grant without ever holding the grantee's
+/// prekeys), and dropping the name at that hop stops membership from crossing it at all. Partial
+/// material is strictly better than none, and dropping a whole delegate because one member is
+/// momentarily missing would strand the rest — so what this returns is a diagnostic, never a
+/// withhold.
+async fn reference_closure<Async, Signer, CRef, Plaintext, CipherStore, Listener, Rng>(
+    keyhive: &Keyhive<Async, Signer, CRef, Plaintext, CipherStore, Listener, Rng>,
+    named_delegates_per_source: &BTreeMap<Identifier, Vec<(EventHash, Identifier)>>,
+    prekey_source_hashes: &BTreeMap<Identifier, Vec<EventHash>>,
+) -> ReferenceClosure
+where
+    Async: future_form::FutureForm,
+    Signer: AsyncSigner<Async> + Clone,
+    CRef: ContentRef,
+    Plaintext: for<'de> serde::Deserialize<'de>,
+    CipherStore: CiphertextStore<Async, CRef, Plaintext>
+        + CiphertextStoreExt<Async, CRef, Plaintext>
+        + Clone,
+    Listener: MembershipListener<Async, Signer, CRef>,
+    Rng: rand::CryptoRng + rand::RngCore,
+{
+    // Invert the source-keyed delegations so each delegate's pick set is walked once, however
+    // many delegations and sources name it.
+    let mut delegations_per_delegate: BTreeMap<Identifier, Vec<(Identifier, EventHash)>> =
+        BTreeMap::new();
+    for (source_id, delegations) in named_delegates_per_source {
+        for (delegation_hash, delegate_id) in delegations {
+            delegations_per_delegate
+                .entry(*delegate_id)
+                .or_default()
+                .push((*source_id, *delegation_hash));
+        }
+    }
+
+    let mut closure = ReferenceClosure::default();
+    for (delegate_id, naming_events) in &delegations_per_delegate {
+        let pickable = pickable_individuals(keyhive, *delegate_id).await;
+        let mut delegate_hashes: BTreeSet<EventHash> = BTreeSet::new();
+        // Whether any pickable individual was *expected* to contribute material. A pick set that
+        // holds only exempt principals, or holds none at all, has nothing to attach by design, so
+        // it cannot be a name held without material.
+        let mut expected_material = false;
+        for individual in &pickable {
+            // `Public` has one well-known key and no prekey ops of its own to attach.
+            if *individual == Public.id() {
+                closure.exempt_individuals_skipped += 1;
+                continue;
+            }
+            expected_material = true;
+            match prekey_source_hashes.get(individual) {
+                Some(hashes) if !hashes.is_empty() => {
+                    delegate_hashes.extend(hashes.iter().copied());
+                }
+                Some(_) => {
+                    // Registered here, but holding no prekey ops: a restore or a prune, since
+                    // an individual is built from the op that registers it.
+                    closure.missing_individuals.insert(*individual);
+                    closure.missing_registered_empty += 1;
+                }
+                None => {
+                    // No op of its own ever reached this node, so nothing to attach.
+                    closure.missing_individuals.insert(*individual);
+                    closure.missing_unregistered += 1;
+                }
+            }
+        }
+        closure.named_delegates += naming_events.len();
+        if !delegate_hashes.is_empty() {
+            for (source_id, _) in naming_events {
+                closure
+                    .attached_per_source
+                    .entry(*source_id)
+                    .or_default()
+                    .extend(delegate_hashes.iter().copied());
+            }
+        } else if expected_material {
+            // A peer receiving this name would hold it without the material to co-sign with the
+            // delegate: worth surfacing, and never a reason to withhold the name itself.
+            closure.uncovered_delegates.insert(*delegate_id);
+            closure.uncovered_naming_events += naming_events.len();
+        }
+    }
+    closure
+}
+
+/// The key ops that must accompany an event naming `agent`.
+///
+/// A peer that records an event naming a principal should later be able to co-sign with everyone
+/// that event makes pickable: keyhive's `pick_individual_prekeys` walks the principal's transitive
+/// members, keeps the individuals at `Read` or better, and needs a published prekey for each of
+/// them. So the material attached to a naming event is that walk's set — an individual's own key
+/// ops, or for a group or document the ops of its member individuals. A group's own entry is
+/// deliberately not part of it: groups and documents routinely publish no prekey of their own, and
+/// keyhive's walk skips nested groups and documents because `transitive_members` is already
+/// transitive.
+///
+/// Whatever we hold is attached and whatever we lack is simply not sent — nothing is withheld. An
+/// intermediate node legitimately holds a name it cannot back (the grant's author had the
+/// delegate's prekeys; a relay may have only learned the grant), so dropping the name at that hop
+/// would stop membership crossing it. `all_agent_events` carries the same rule on the path that
+/// runs in practice.
+///
+/// Attachment is a lookup into the exchange-wide reachability pass rather than another walk: its
+/// `ops` map is keyed by every principal in the graph. Its `index` is not usable here, because it is
+/// keyed by member — a principal's entry lists the containers it belongs to, never the members it
+/// contains.
+async fn prekey_closure_for_agent<Async, Signer, CRef, Plaintext, CipherStore, Listener, Rng>(
+    keyhive: &Keyhive<Async, Signer, CRef, Plaintext, CipherStore, Listener, Rng>,
+    reachable: &AllReachablePrekeyOps,
+    agent: Identifier,
+) -> Vec<(Digest<StaticEvent<CRef>>, StaticEvent<CRef>)>
+where
+    Async: future_form::FutureForm,
+    Signer: AsyncSigner<Async> + Clone,
+    CRef: ContentRef,
+    Plaintext: for<'de> serde::Deserialize<'de>,
+    CipherStore: CiphertextStore<Async, CRef, Plaintext>
+        + CiphertextStoreExt<Async, CRef, Plaintext>
+        + Clone,
+    Listener: MembershipListener<Async, Signer, CRef>,
+    Rng: rand::CryptoRng + rand::RngCore,
+{
+    let pickable = pickable_individuals(keyhive, agent).await;
+
+    let mut attached: Vec<(Digest<StaticEvent<CRef>>, StaticEvent<CRef>)> = Vec::new();
+    for id in pickable {
+        for op in reachable.ops.get(&id).into_iter().flatten() {
+            // The digest is taken over the `Event` and coerced, exactly as `events_for_agent`
+            // derives the pairs it hands to `static_events_for_agent`: the peer hashes the same
+            // bytes, so an attachment deduplicates against the selection instead of being served
+            // twice.
+            let event = Event::<Async, Signer, CRef, Listener>::from(op.as_ref().dupe());
+            attached.push((Digest::hash(&event).coerce(), event.into()));
+        }
+    }
+    attached
 }
 
 /// Hash, serialize, and deduplicate events into `event_data`, returning hashes.
@@ -2225,7 +2600,10 @@ mod tests {
     use future_form::{FutureForm, Local};
     use keyhive_core::{
         access::Access,
-        principal::{identifier::Identifier, membered::Membered, peer::Peer},
+        principal::{
+            identifier::Identifier,
+            membered::{Membered, id::MemberedId},
+        },
     };
     use nonempty::nonempty;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
@@ -2282,11 +2660,631 @@ mod tests {
         }
     }
 
+    /// The reference closure keys off the agent a delegation names, and nothing else.
+    ///
+    /// A delegation is the only static event that adds a co-signing counterparty: prekey and CGKA
+    /// events name no agent, and a revocation removes one (no key material is needed to act on a
+    /// removal).
+    #[test]
+    fn named_agents_matches_delegates_only() {
+        use keyhive_core::principal::{
+            group::delegation::StaticDelegation, individual::op::add_key::AddKeyOp,
+        };
+        use keyhive_crypto::share_key::ShareKey;
+
+        let issuer = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng).verifying_key();
+        let delegate =
+            Identifier(ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng).verifying_key());
+        let signature = ed25519_dalek::Signature::from_bytes(&[0u8; 64]);
+
+        let delegation = StaticEvent::Delegated(Signed::new(
+            StaticDelegation::<[u8; 32]> {
+                can: Access::Read,
+                proof: None,
+                delegate,
+                after_revocations: Vec::new(),
+                after_content: BTreeMap::new(),
+            },
+            issuer,
+            signature,
+        ));
+        let prekey = StaticEvent::PrekeysExpanded(Box::new(Signed::new(
+            // Built from its public field: `AddKeyOp::generate` sits behind keyhive's `test_utils`
+            // feature, which this crate does not enable.
+            AddKeyOp {
+                share_key: ShareKey::generate(&mut rand::rngs::OsRng),
+            },
+            issuer,
+            signature,
+        )));
+
+        let named = named_agents([&delegation, &prekey].into_iter());
+        assert_eq!(named.len(), 1, "only the delegation names a counterparty");
+        assert!(named.contains(&delegate));
+    }
+
+    /// The owner of a prekey event, for asserting whose material a closure attached.
+    fn prekey_owner(event: &StaticEvent<[u8; 32]>) -> Option<Identifier> {
+        match event {
+            StaticEvent::PrekeysExpanded(op) => Some(Identifier(op.issuer)),
+            StaticEvent::PrekeyRotated(op) => Some(Identifier(op.issuer)),
+            StaticEvent::CgkaOperation(_) | StaticEvent::Delegated(_) | StaticEvent::Revoked(_) => {
+                None
+            }
+        }
+    }
+
+    /// The closure attaches an individual's own key ops, and attaches nothing for an agent we
+    /// hold none for.
+    ///
+    /// The second half is load bearing: every principal's reachable set includes the active
+    /// individual, so an agent we hold nothing for must not come back "covered" by our own ops.
+    ///
+    /// Nothing is ever withheld: an agent we cannot cover is attached as empty rather than
+    /// refused, because a relay legitimately holds a name it cannot back and dropping the name
+    /// at that hop would stop membership from crossing it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn prekey_closure_covers_known_agents_and_refuses_unknown_ones() {
+        let harness = exchange_contact_cards_and_setup().await;
+        deliver_own_prekey_ops(harness.alice_kh.as_ref(), harness.bob_kh.as_ref()).await;
+        let bob = harness.bob_id.to_identifier().expect("bob identifier");
+        let reachable = harness.alice_kh.reachable_prekey_ops_for_all_agents().await;
+
+        let attached = prekey_closure_for_agent(harness.alice_kh.as_ref(), &reachable, bob).await;
+        assert!(
+            attached
+                .iter()
+                .any(|(_, event)| prekey_owner(event) == Some(bob)),
+            "the named individual's own key ops must be attached"
+        );
+
+        let stranger =
+            Identifier(ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng).verifying_key());
+        assert!(
+            prekey_closure_for_agent(harness.alice_kh.as_ref(), &reachable, stranger)
+                .await
+                .is_empty(),
+            "an agent we hold no key ops for must attach nothing"
+        );
+    }
+
+    /// A group delegate is covered through its members, not through its own ops.
+    ///
+    /// Daybook documents delegate to their drawer and content-docs groups, and those groups publish
+    /// no prekey of their own — so a gate that read the named principal's own entry withheld
+    /// exactly the delegations the product creates.
+    #[tokio::test(flavor = "current_thread")]
+    async fn prekey_closure_covers_a_group_delegate_through_its_members() {
+        let harness = exchange_contact_cards_and_setup().await;
+        deliver_own_prekey_ops(harness.alice_kh.as_ref(), harness.bob_kh.as_ref()).await;
+        let bob = harness.bob_id.to_identifier().expect("bob identifier");
+        let group_id =
+            create_group_with_read_members(harness.alice_kh.as_ref(), &[&harness.bob_id]).await;
+        let group = Identifier::from(MemberedId::GroupId(group_id));
+        let reachable = harness.alice_kh.reachable_prekey_ops_for_all_agents().await;
+
+        // Precondition of the case being covered: the group published nothing of its own, and the
+        // member's ops are held.
+        assert!(
+            reachable.ops.get(&group).is_none_or(Vec::is_empty),
+            "precondition: the group published no prekey of its own"
+        );
+        assert!(
+            reachable.ops.get(&bob).is_some_and(|ops| !ops.is_empty()),
+            "precondition: alice holds the member's key ops"
+        );
+
+        let attached = prekey_closure_for_agent(harness.alice_kh.as_ref(), &reachable, group).await;
+        assert!(
+            !attached.is_empty(),
+            "a group delegate is covered by its members' key ops"
+        );
+        assert!(
+            attached
+                .iter()
+                .any(|(_, event)| prekey_owner(event) == Some(bob)),
+            "the member's key ops must be attached for a group delegate"
+        );
+    }
+
+    /// Decode every event a peer would be served, from an advertisement alone.
+    ///
+    /// The bytes come out of `event_data`, so this asserts servability as well as membership: a
+    /// hash in a peer's set with no bytes behind it is a promise the response cannot keep.
+    fn advertised_events(
+        snapshot: &crate::all_agent_events::AllAgentEvents,
+        peer: &KeyhivePeerId,
+    ) -> Vec<StaticEvent<[u8; 32]>> {
+        snapshot
+            .hashes_for(peer)
+            .expect("the peer must have an advertised set")
+            .iter()
+            .filter_map(|hash| snapshot.event_data.get(hash))
+            .map(|bytes| bincode_deserialize(bytes).expect("advertised bytes are a static event"))
+            .collect()
+    }
+
+    /// Whether an advertisement carries the named agent's own key ops.
+    fn advertises_prekey_of(advertisement: &AgentHashMap, who: Identifier) -> bool {
+        advertisement
+            .values()
+            .filter_map(|bytes| bincode_deserialize::<StaticEvent<[u8; 32]>>(bytes).ok())
+            .any(|event| prekey_owner(&event) == Some(who))
+    }
+
+    /// Install `from`'s own key ops into `to`, which is how a peer learns them from a sync.
+    ///
+    /// A contact card alone does not establish "we hold their key ops". The card is a *rotation*, so
+    /// it installs a rotation-only state, and at the keyhive rev this workspace resolves
+    /// (`keyhive_core` git rev `28a53997`, `Cargo.toml`) `KeyOp::topsort` seeds only from `Add` ops —
+    /// a rotation-only state therefore serializes to **zero** ops, and
+    /// `reachable_prekey_ops_for_all_agents` reports nothing for an individual learned that way. A
+    /// fixture that stops at the card exchange therefore does not hold the key ops it assumes, and
+    /// the resulting failure looks like a missing attachment instead of a missing precondition.
+    /// (That is the prekey-loss bug `../keyhive` fixes in its working copy; the `[patch]` that would
+    /// supply it here is commented out in `Cargo.toml`.)
+    ///
+    /// Delivering the ops explicitly makes the fixtures below independent of which keyhive the
+    /// workspace resolves against, so they test the advertisement rather than the dependency's
+    /// topsort — and it is faithful: receiving a peer's static prekey events is the production path.
+    async fn deliver_own_prekey_ops(to: &SimpleKeyhive, from: &SimpleKeyhive) {
+        let from_id: Identifier = from.id().into();
+        let ops = from
+            .reachable_prekey_ops_for_all_agents()
+            .await
+            .ops
+            .get(&from_id)
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            !ops.is_empty(),
+            "precondition: `from`'s own key ops must exist for them to be delivered"
+        );
+        for op in ops {
+            to.receive_prekey_op(&op).await.expect("ingest peer key op");
+        }
+    }
+
+    /// An attachment assertion about `who` is only meaningful if we hold `who`'s key ops.
+    async fn assert_holds_prekey_ops(to: &SimpleKeyhive, who: Identifier) {
+        assert!(
+            to.reachable_prekey_ops_for_all_agents()
+                .await
+                .ops
+                .get(&who)
+                .is_some_and(|ops| !ops.is_empty()),
+            "precondition: the fixture must hold {who}'s key ops for an attachment to have material"
+        );
+    }
+
+    /// The advertisement path production runs attaches a delegate's key ops to the event naming
+    /// him.
+    ///
+    /// Path fact: `all_agent_events` is the only thing `SyncCache::refresh` calls, and the cache is
+    /// what `sync_keyhive_for_request` serves a peer from. The fallback (`close_references` →
+    /// `prekey_closure_for_agent`) runs only when no cached pair exists, so a test that exercised
+    /// only the fallback would prove nothing about what a peer is actually told.
+    ///
+    /// The delegate is revoked, and that is what makes the assertion load bearing: a revoked
+    /// delegate is no longer in the document's `transitive_members`, so neither the co-member's
+    /// reachability sets nor the group walks can produce his key ops — yet the delegation that
+    /// names him is still part of the document's membership history and is still advertised. Only
+    /// the attachment can put the two in the same message.
+    #[tokio::test(flavor = "current_thread")]
+    async fn advertisement_attaches_the_delegates_pickable_prekey_hashes() {
+        let alice = make_keyhive().await;
+        let bob = make_keyhive().await;
+        let carol = make_keyhive().await;
+        exchange_all_contact_cards(&[&alice, &bob, &carol]).await;
+        deliver_own_prekey_ops(&alice, &bob).await;
+
+        let bob_identifier: Identifier = bob.id().into();
+        let carol_identifier: Identifier = carol.id().into();
+        let carol_id = keyhive_peer_id(&carol);
+
+        let (alice_proto, alice_kh, _) = make_protocol_with_shared_keyhive(alice).await;
+
+        let doc = alice_kh
+            .generate_doc(vec![], nonempty![[0u8; 32]])
+            .await
+            .unwrap();
+        let doc_id = doc;
+        let doc = alice_kh
+            .get_document(doc_id)
+            .await
+            .expect("generated document is present");
+        let membered = Membered::Document(doc_id, doc.clone());
+        alice_kh
+            .add_member(bob_identifier, membered.membered_id(), Access::Edit, &[])
+            .await
+            .unwrap();
+        alice_kh
+            .add_member(carol_identifier, membered.membered_id(), Access::Read, &[])
+            .await
+            .unwrap();
+        alice_kh
+            .revoke_member(bob_identifier, true, membered.membered_id())
+            .await
+            .unwrap();
+
+        assert!(
+            !doc.lock()
+                .await
+                .transitive_members()
+                .await
+                .contains_key(&bob_identifier),
+            "precondition: the revoked delegate is not a transitive member any more"
+        );
+        assert_holds_prekey_ops(&alice_kh, bob_identifier).await;
+
+        let snapshot = alice_proto
+            .all_agent_events(&BTreeSet::new())
+            .await
+            .unwrap();
+        let advertised = advertised_events(&snapshot, &carol_id);
+
+        assert!(
+            advertised.iter().any(|event| matches!(
+                event,
+                StaticEvent::Delegated(delegation)
+                    if delegation.payload.delegate == bob_identifier
+            )),
+            "the delegation naming the delegate must be advertised"
+        );
+        assert!(
+            advertised
+                .iter()
+                .any(|event| prekey_owner(event) == Some(bob_identifier)),
+            "the delegate's key ops must be attached to the event that names him"
+        );
+    }
+
+    /// A group delegate is covered through its members' key ops, not through its own.
+    ///
+    /// Daybook documents delegate to their drawer and content-docs groups, so this is the hot
+    /// path. The first implementation walked the named principal's containers and produced nothing
+    /// for a group — a group's own op set is routinely empty — which withheld precisely the
+    /// delegations the product creates. This is the test that catches that walk coming back.
+    #[tokio::test(flavor = "current_thread")]
+    async fn advertisement_attaches_a_group_delegates_member_prekeys() {
+        let alice = make_keyhive().await;
+        let bob = make_keyhive().await;
+        let carol = make_keyhive().await;
+        exchange_all_contact_cards(&[&alice, &bob, &carol]).await;
+        deliver_own_prekey_ops(&alice, &bob).await;
+
+        let bob_identifier: Identifier = bob.id().into();
+        let carol_identifier: Identifier = carol.id().into();
+        let carol_id = keyhive_peer_id(&carol);
+        let group_id = create_group_with_read_members(&alice, &[&keyhive_peer_id(&bob)]).await;
+        let group = Identifier::from(MemberedId::GroupId(group_id));
+
+        let (alice_proto, alice_kh, _) = make_protocol_with_shared_keyhive(alice).await;
+
+        let doc = alice_kh
+            .generate_doc(vec![], nonempty![[0u8; 32]])
+            .await
+            .unwrap();
+        let doc_id = doc;
+        let doc = alice_kh
+            .get_document(doc_id)
+            .await
+            .expect("generated document is present");
+        let membered = Membered::Document(doc_id, doc.clone());
+        alice_kh
+            .add_member(group, membered.membered_id(), Access::Read, &[])
+            .await
+            .unwrap();
+        alice_kh
+            .add_member(carol_identifier, membered.membered_id(), Access::Read, &[])
+            .await
+            .unwrap();
+
+        assert!(
+            alice_kh
+                .reachable_prekey_ops_for_all_agents()
+                .await
+                .ops
+                .get(&group)
+                .is_none_or(Vec::is_empty),
+            "precondition: the group published no prekey of its own"
+        );
+        assert_holds_prekey_ops(&alice_kh, bob_identifier).await;
+
+        let snapshot = alice_proto
+            .all_agent_events(&BTreeSet::new())
+            .await
+            .unwrap();
+        let advertised = advertised_events(&snapshot, &carol_id);
+
+        assert!(
+            advertised.iter().any(|event| matches!(
+                event,
+                StaticEvent::Delegated(delegation) if delegation.payload.delegate == group
+            )),
+            "the delegation naming the group must be advertised"
+        );
+        assert!(
+            advertised
+                .iter()
+                .any(|event| prekey_owner(event) == Some(bob_identifier)),
+            "the group's members' key ops must be attached for a group delegate"
+        );
+    }
+
+    /// A name is always advertised, even when the material behind it cannot be attached.
+    ///
+    /// This is the half that was added, measured harmful, and removed: a relay legitimately holds
+    /// a name it cannot back, and withholding the name at that hop stops membership from crossing
+    /// it at all (a deleted-branch topology went from passing in 1.76s to a permanent stall).
+    /// Attachment is per delegate and never conditional on the whole set being covered, so a
+    /// regression that re-adds the withhold is caught here by the naming event disappearing from a
+    /// peer's advertised set.
+    ///
+    /// The witness for "nothing attachable" is `Public`: the attachment loop skips it by
+    /// construction, so no material is ever attached for a delegation naming it. That skip is
+    /// *exempt* rather than uncovered — `Public` has one well-known key and publishes no prekey ops
+    /// of its own — so it is counted as `exempt_individuals_skipped` and never as
+    /// `uncovered_delegates`. The counters are assertable from here: `reference_closure` returns the
+    /// whole `ReferenceClosure`, and `coverage_reports_absent_material_and_not_the_exempt_skip`
+    /// asserts that a `Public`-only round reports zero uncovered. What *this* test asserts is the
+    /// rule and its shape: the name stays, and the delegate we do hold material for is attached in
+    /// the same advertisement.
+    #[tokio::test(flavor = "current_thread")]
+    async fn advertisement_never_withholds_a_name_whose_material_is_missing() {
+        use keyhive_core::principal::public::Public;
+
+        let alice = make_keyhive().await;
+        let bob = make_keyhive().await;
+        exchange_all_contact_cards(&[&alice, &bob]).await;
+        deliver_own_prekey_ops(&alice, &bob).await;
+
+        let bob_identifier: Identifier = bob.id().into();
+        let bob_id = keyhive_peer_id(&bob);
+
+        let (alice_proto, alice_kh, _) = make_protocol_with_shared_keyhive(alice).await;
+
+        let doc = alice_kh
+            .generate_doc(vec![], nonempty![[0u8; 32]])
+            .await
+            .unwrap();
+        let doc_id = doc;
+        let doc = alice_kh
+            .get_document(doc_id)
+            .await
+            .expect("generated document is present");
+        let membered = Membered::Document(doc_id, doc.clone());
+        // One delegate we hold material for, one we never can.
+        alice_kh
+            .add_member(bob_identifier, membered.membered_id(), Access::Edit, &[])
+            .await
+            .unwrap();
+        // `Public` is a unit principal; binding it keeps the call below shaped like the other
+        // delegate additions in this module.
+        let public_delegate = Public;
+        alice_kh
+            .add_member(
+                public_delegate.id(),
+                membered.membered_id(),
+                Access::Edit,
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let snapshot = alice_proto
+            .all_agent_events(&BTreeSet::new())
+            .await
+            .unwrap();
+        let advertised = advertised_events(&snapshot, &bob_id);
+
+        // Direction 1: a delegation nothing can be attached for is still advertised. This is the
+        // half that was added, measured harmful, and removed — withholding the name at a hop that
+        // cannot back it stopped membership from crossing that hop entirely (a deleted-branch
+        // topology went from passing in 1.76s to a permanent stall), so a regression here is the
+        // stall coming back. `Public` is the witness because the attachment loop skips it by
+        // construction, so nothing is ever attached for a delegation naming it.
+        assert!(
+            advertised.iter().any(|event| matches!(
+                event,
+                StaticEvent::Delegated(delegation) if delegation.payload.delegate == Public.id()
+            )),
+            "a name whose material cannot be attached must still be advertised"
+        );
+        // Direction 2: attachment is per delegate and never conditional on the whole set being
+        // covered, so the delegate we do hold material for is attached in the same advertisement.
+        assert!(
+            advertised
+                .iter()
+                .any(|event| prekey_owner(event) == Some(bob_identifier)),
+            "the covered delegate's key ops must still be attached in the same advertisement"
+        );
+        // Note on the state itself: "nothing is attachable for `Public`" is *not* observable as
+        // "no `Public`-owned prekey event is advertised". `Public` is a member of this document, so
+        // `all_prekey.index[bob]` is extended with every transitive member of the document,
+        // `Public` included, and `Public`'s own individual is built from an `AddKeyOp` — so its
+        // ops reach `bob` through the ordinary reachability sets regardless of any attachment. What
+        // is empty here is the Phase 3 attachment for `Public`'s delegation (the loop `continue`s
+        // on `Public`, which is exempt and counted as `exempt_individuals_skipped` instead), and the
+        // counters are readable from here through `reference_closure`'s `ReferenceClosure`.
+        //
+        // Worth knowing for whoever reads those diagnostics: the `Public` skip is exempt, so a round
+        // carrying only a delegation naming `Public` reports zero `uncovered_delegates` and zero
+        // `uncovered_naming_events`, plus one `exempt_individuals_skipped`. The "name without
+        // material" counter can therefore be read as "a split occurred" again, and
+        // `coverage_reports_absent_material_and_not_the_exempt_skip` pins that reading in three
+        // directions — so a change that silenced the counter wholesale fails it too.
+    }
+
+    /// The coverage counters report absent material, and not the deliberate `Public` skip.
+    ///
+    /// `Public` is skipped for attachment because its key is well known and it publishes no prekey
+    /// ops of its own, so a delegation naming only `Public` has nothing to attach — by design. The
+    /// coverage check used to run *after* that skip, so the skip counted as absent material: any
+    /// round naming `Public` reported `uncovered_delegates` containing `Public` and a non-zero
+    /// `uncovered_naming_events`. That made the counter — the diagnostic an operator reads to
+    /// decide whether a "name without material" split occurred — permanently unable to distinguish
+    /// "a split occurred" from "the round mentioned `Public`".
+    ///
+    /// All three directions are asserted, because a change that silenced the counter entirely
+    /// would satisfy the first: a `Public`-only round is not a withhold, a round that also names a
+    /// delegate whose material never arrived still reports that delegate, and the same delegate
+    /// with material in hand is attached rather than reported.
+    #[tokio::test(flavor = "current_thread")]
+    async fn coverage_reports_absent_material_and_not_the_exempt_skip() {
+        let alice = make_keyhive().await;
+        let bob = make_keyhive().await;
+        let bob_identifier: Identifier = bob.id().into();
+        let source: Identifier = alice.id().into();
+
+        // Three delegates over one naming source: the exempt principal, one whose material never
+        // arrived, and — for the last direction — one whose material is in hand.
+        let public_naming: (EventHash, Identifier) = ([1; 32], Public.id());
+        let absent_naming: (EventHash, Identifier) = ([2; 32], bob_identifier);
+        let public_only = BTreeMap::from([(source, vec![public_naming])]);
+        let with_absent = BTreeMap::from([(source, vec![public_naming, absent_naming])]);
+        let empty_prekeys: BTreeMap<Identifier, Vec<EventHash>> = BTreeMap::new();
+
+        // Direction 1: a round naming only `Public` is not a withhold at all. `Public` is not a
+        // membered principal, so its pick set is itself — the case the skip exists for.
+        let closure = reference_closure(&alice, &public_only, &empty_prekeys).await;
+        assert_eq!(
+            closure.uncovered_delegates,
+            BTreeSet::new(),
+            "an exempt principal has no material that can be absent"
+        );
+        assert_eq!(
+            closure.uncovered_naming_events, 0,
+            "a round naming only `Public` names no event without material"
+        );
+        assert_eq!(
+            closure.exempt_individuals_skipped, 1,
+            "the skip still happens, and is reported under its own name"
+        );
+
+        // Direction 2: the same round still reports the delegate whose material is absent, so the
+        // counter cannot be silenced into passing direction 1.
+        let closure = reference_closure(&alice, &with_absent, &empty_prekeys).await;
+        assert_eq!(
+            closure.uncovered_delegates,
+            BTreeSet::from([bob_identifier]),
+            "a delegate whose material never arrived is still reported"
+        );
+        assert_eq!(
+            closure.uncovered_naming_events, 1,
+            "the naming event for the absent delegate is counted once"
+        );
+
+        // Direction 3: the same delegate with material in hand is attached, not reported — the
+        // attachment itself is unchanged, only the diagnostic was wrong.
+        let bob_prekeys: BTreeMap<Identifier, Vec<EventHash>> =
+            BTreeMap::from([(bob_identifier, vec![[7; 32]])]);
+        let closure = reference_closure(&alice, &with_absent, &bob_prekeys).await;
+        assert_eq!(
+            closure.uncovered_delegates,
+            BTreeSet::new(),
+            "material in hand is not an absence"
+        );
+        assert_eq!(
+            closure.attached_per_source.get(&source),
+            Some(&BTreeSet::from([[7u8; 32]])),
+            "the held material is attached to the event naming the delegate"
+        );
+    }
+
+    /// The served advertisement is rebuilt once the material behind a name becomes pickable.
+    ///
+    /// Path fact: the cache is what a peer is served from, and `ensure_cache_current` gates its
+    /// rebuild on two integer samples (`state_generation()` + `nested_store_generation_sum()`),
+    /// which `cache.rs` documents as the reason it must never be skipped on indirect heuristics. A
+    /// mutation that bumps neither counter leaves a stale advertisement that will never tell the
+    /// peer about events it needs — silent divergence, which is the failure this pins.
+    ///
+    /// The material here arrives as *membership*: the document already names the group, and Bob
+    /// joins that group between the two refreshes, which is what makes the document's delegate
+    /// pickable and its key ops part of what co-members are told.
+    #[tokio::test(flavor = "current_thread")]
+    async fn refresh_cache_reattaches_after_prekey_ops_land() {
+        let alice = make_keyhive().await;
+        let bob = make_keyhive().await;
+        let carol = make_keyhive().await;
+        exchange_all_contact_cards(&[&alice, &bob, &carol]).await;
+        deliver_own_prekey_ops(&alice, &bob).await;
+
+        let alice_id = keyhive_peer_id(&alice);
+        let carol_id = keyhive_peer_id(&carol);
+        let bob_identifier: Identifier = bob.id().into();
+        let carol_identifier: Identifier = carol.id().into();
+
+        // A group with no members yet: the document names it, so a co-member learns the name
+        // while there is nothing to attach for the principal it points at.
+        let group_id = alice.generate_group(vec![]).await.unwrap();
+        let group = Identifier::from(MemberedId::GroupId(group_id));
+
+        let (alice_proto, alice_kh, _) = make_protocol_with_shared_keyhive(alice).await;
+        let (carol_conn, _inbound) = create_channel_pair(alice_id.clone(), &carol_id);
+        alice_proto.add_peer(carol_id.clone(), carol_conn).await;
+
+        // The delegate's material is in hand before the first refresh: what the two refreshes
+        // below separate is the delegate becoming *pickable*, not the ops arriving.
+        assert_holds_prekey_ops(&alice_kh, bob_identifier).await;
+
+        let doc = alice_kh
+            .generate_doc(vec![], nonempty![[0u8; 32]])
+            .await
+            .unwrap();
+        let doc_id = doc;
+        let doc = alice_kh
+            .get_document(doc_id)
+            .await
+            .expect("generated document is present");
+        let membered = Membered::Document(doc_id, doc.clone());
+        alice_kh
+            .add_member(group, membered.membered_id(), Access::Read, &[])
+            .await
+            .unwrap();
+        alice_kh
+            .add_member(carol_identifier, membered.membered_id(), Access::Read, &[])
+            .await
+            .unwrap();
+
+        alice_proto.refresh_cache().await.unwrap();
+        let before = alice_proto
+            .cached_events_for_pair_with_peer(&carol_id)
+            .await
+            .expect("the co-member has a cached advertisement");
+        assert!(
+            !advertises_prekey_of(&before, bob_identifier),
+            "precondition: Bob is not pickable for the document's group yet"
+        );
+
+        // The material lands: Bob joins the group the document names.
+        alice_kh
+            .add_member(
+                bob_identifier,
+                MemberedId::GroupId(group_id),
+                Access::Read,
+                &[],
+            )
+            .await
+            .unwrap();
+
+        alice_proto.refresh_cache().await.unwrap();
+        let after = alice_proto
+            .cached_events_for_pair_with_peer(&carol_id)
+            .await
+            .expect("the co-member still has a cached advertisement");
+        assert!(
+            advertises_prekey_of(&after, bob_identifier),
+            "the refreshed advertisement must carry the newly pickable delegate's key ops"
+        );
+    }
+
     /// Helper to create a test protocol instance.
     async fn make_protocol() -> (TestProtocol, SimpleKeyhive) {
         let keyhive = make_keyhive().await;
         let peer_id = keyhive_peer_id(&keyhive);
-        let cc = keyhive.contact_card().await.unwrap();
+        let cc = keyhive.generate_contact_card().await.unwrap();
         let storage = MemoryKeyhiveStorage::new();
         let shared = Arc::new(keyhive.clone());
         let protocol = TestProtocol::new(shared, storage, peer_id, cc);
@@ -2464,7 +3462,10 @@ mod tests {
         let (conn1, _) = create_channel_pair(peer_id.clone(), &peer1);
         let (conn2, _) = create_channel_pair(peer_id.clone(), &peer2);
 
-        assert!(protocol.peer_ids().await.is_empty(), "no peers before any add");
+        assert!(
+            protocol.peer_ids().await.is_empty(),
+            "no peers before any add"
+        );
 
         protocol.add_peer(peer1.clone(), conn1).await;
         protocol.add_peer(peer2.clone(), conn2).await;
@@ -2571,6 +3572,75 @@ mod tests {
         );
     }
 
+    /// A peer the local keyhive has never seen must not look like one it knows.
+    ///
+    /// This is the protocol-facing half of the cache distinction. Both cases serve the
+    /// public set, so the pair lookup used to answer both with the same map and callers
+    /// inferred "unknown" from emptiness — which never held, so the contact-card request
+    /// never fired and a peer's key material was never delivered.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_unknown_peer_has_no_cached_pair_while_a_known_peer_does() {
+        let (alice_proto, alice_kh) = make_protocol().await;
+
+        // Bob is known: alice holds his card, and therefore his individual. The pair
+        // still shares nothing private, so the served set is only the public set — the
+        // case that used to be indistinguishable from a peer we have never met.
+        let (bob_proto, bob_kh) = make_protocol().await;
+        let bob_id = bob_proto.peer_id.clone();
+        let bob_cc = bob_kh.generate_contact_card().await.unwrap();
+        alice_kh.receive_contact_card(&bob_cc).await.unwrap();
+        alice_proto.refresh_cache().await.unwrap();
+        assert!(
+            alice_proto
+                .cached_events_for_pair_with_peer(&bob_id)
+                .await
+                .is_some(),
+            "a peer whose identity the hive holds has a cached pair, even when the \
+             served set is public-only"
+        );
+
+        // Carol is a peer alice's keyhive has never seen: no projection exists for her,
+        // and the cache must say so rather than answering with the public set.
+        let carol_kh = make_keyhive().await;
+        let carol_id = keyhive_peer_id(&carol_kh);
+        assert!(
+            alice_proto
+                .cached_events_for_pair_with_peer(&carol_id)
+                .await
+                .is_none(),
+            "an unknown peer must not be presented as a cached pair: that is the signal \
+             the contact-card request turns on"
+        );
+    }
+
+    /// A peer we already know must get our advertisement, not a contact-card request.
+    ///
+    /// The other half of the distinction: the fix must not over-correct into asking a
+    /// known peer for credentials we already hold.
+    #[tokio::test(flavor = "current_thread")]
+    async fn sync_sends_a_request_to_a_known_peer_rather_than_asking_for_its_card() {
+        let (alice_proto, alice_kh) = make_protocol().await;
+        let alice_id = alice_proto.peer_id.clone();
+
+        let (bob_proto, bob_kh) = make_protocol().await;
+        let bob_id = bob_proto.peer_id.clone();
+        let bob_cc = bob_kh.generate_contact_card().await.unwrap();
+        alice_kh.receive_contact_card(&bob_cc).await.unwrap();
+
+        let (alice_conn, bob_conn) = create_channel_pair(alice_id.clone(), &bob_id);
+        alice_proto.add_peer(bob_id.clone(), alice_conn).await;
+
+        alice_proto.sync_keyhive(Some(&bob_id)).await.unwrap();
+
+        let signed_msg = bob_conn.inbound_rx.recv().await.unwrap();
+        let verified = signed_msg.verify(&alice_id).unwrap();
+        let decoded: Message = cbor_deserialize(&verified.payload).unwrap();
+        assert!(
+            matches!(decoded, Message::SyncRequest { .. }),
+            "a known peer must be sent a sync request, not a contact-card ask: {decoded:?}"
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn sync_request_response_flow_with_known_peers() {
         // Set up Alice and Bob who know each other
@@ -2581,8 +3651,8 @@ mod tests {
         let bob_id = bob_proto.peer_id.clone();
 
         // Exchange contact cards at the keyhive level
-        let alice_cc = alice_kh.contact_card().await.unwrap();
-        let bob_cc = bob_kh.contact_card().await.unwrap();
+        let alice_cc = alice_kh.generate_contact_card().await.unwrap();
+        let bob_cc = bob_kh.generate_contact_card().await.unwrap();
         alice_kh.receive_contact_card(&bob_cc).await.unwrap();
         bob_kh.receive_contact_card(&alice_cc).await.unwrap();
 
@@ -2642,8 +3712,8 @@ mod tests {
         let bob_id = keyhive_peer_id(&bob_kh);
 
         // Exchange contact cards
-        let alice_cc = alice_kh.contact_card().await.unwrap();
-        let bob_cc = bob_kh.contact_card().await.unwrap();
+        let alice_cc = alice_kh.generate_contact_card().await.unwrap();
+        let bob_cc = bob_kh.generate_contact_card().await.unwrap();
         alice_kh.receive_contact_card(&bob_cc).await.unwrap();
         bob_kh.receive_contact_card(&alice_cc).await.unwrap();
 
@@ -2793,8 +3863,8 @@ mod tests {
         let alice_id = keyhive_peer_id(&alice_kh);
         let bob_id = keyhive_peer_id(&bob_kh);
 
-        let alice_cc = alice_kh.contact_card().await.unwrap();
-        let bob_cc = bob_kh.contact_card().await.unwrap();
+        let alice_cc = alice_kh.generate_contact_card().await.unwrap();
+        let bob_cc = bob_kh.generate_contact_card().await.unwrap();
         alice_kh.receive_contact_card(&bob_cc).await.unwrap();
         bob_kh.receive_contact_card(&alice_cc).await.unwrap();
 
@@ -2840,11 +3910,11 @@ mod tests {
         let other = make_keyhive().await;
         let member = make_keyhive().await;
         let member_id = keyhive_peer_id(&member);
-        let member_cc = member.contact_card().await.unwrap();
+        let member_cc = member.generate_contact_card().await.unwrap();
         other.receive_contact_card(&member_cc).await.unwrap();
 
         let other_id = keyhive_peer_id(&other);
-        let other_cc = other.contact_card().await.unwrap();
+        let other_cc = other.generate_contact_card().await.unwrap();
         let other_proto = TestProtocol::new(
             Arc::new(other.clone()),
             MemoryKeyhiveStorage::new(),
@@ -2854,7 +3924,7 @@ mod tests {
 
         // Group-creation delegation.
         let group = other.generate_group(vec![]).await.unwrap();
-        let group_id = group.lock().await.group_id();
+        let group_id = group;
         let before_add_events = other_proto
             .get_events_for_agent(&other_id)
             .await
@@ -2867,17 +3937,16 @@ mod tests {
         );
 
         // Add-member delegation, which depends on the group-creation one.
+        // Restrict `dependent` to the delegation itself: since keyhive 0.6.0
+        // `add_member` may also emit an independent prekey op (e.g. a rotation)
+        // that is admissible without the group-creation dependency being
+        // present, which would defeat the pending-to-active premise below.
         let agent = other
             .get_agent(member_id.to_identifier().unwrap())
             .await
             .unwrap();
         other
-            .add_member(
-                agent,
-                &Membered::Group(group_id, group.clone()),
-                Access::Read,
-                &[],
-            )
+            .add_member(agent.id(), MemberedId::GroupId(group_id), Access::Read, &[])
             .await
             .unwrap();
         let dependent: Vec<Arc<[u8]>> = other_proto
@@ -2887,6 +3956,10 @@ mod tests {
             .expect("other resolves to an agent")
             .into_iter()
             .filter(|(hash, _)| !before_add.contains(hash))
+            .filter(|(_, bytes)| {
+                bincode_deserialize::<StaticEvent<[u8; 32]>>(bytes)
+                    .is_ok_and(|event| matches!(event, StaticEvent::Delegated(_)))
+            })
             .map(|(_, bytes)| bytes)
             .collect();
         assert!(
@@ -2902,10 +3975,13 @@ mod tests {
             Arc::new(dst_resolution.clone()),
             MemoryKeyhiveStorage::new(),
             keyhive_peer_id(&dst_resolution),
-            dst_resolution.contact_card().await.unwrap(),
+            dst_resolution.generate_contact_card().await.unwrap(),
         )
         .with_durable_incorporation_sink(sink_resolution.clone());
-        proto_resolution.ingest_events(&dependent, None).await.unwrap();
+        proto_resolution
+            .ingest_events(&dependent, None)
+            .await
+            .unwrap();
         assert!(sink_resolution.admitted.lock().await.is_empty());
         let dependencies: Vec<Arc<[u8]>> = before_add_events.into_values().collect();
         proto_resolution
@@ -2932,7 +4008,7 @@ mod tests {
             Arc::new(dst_off.clone()),
             storage.clone(),
             keyhive_peer_id(&dst_off),
-            dst_off.contact_card().await.unwrap(),
+            dst_off.generate_contact_card().await.unwrap(),
         );
         let before_off = proto_off.total_ops().await;
         proto_off.ingest_events(&dependent, None).await.unwrap();
@@ -2949,7 +4025,7 @@ mod tests {
             Arc::new(dst_on.clone()),
             storage.clone(),
             keyhive_peer_id(&dst_on),
-            dst_on.contact_card().await.unwrap(),
+            dst_on.generate_contact_card().await.unwrap(),
         )
         .with_storage_recovery();
         let before_on = proto_on.total_ops().await;
@@ -3102,8 +4178,10 @@ mod tests {
     async fn boot_reconciliation_reports_crash_window_once() {
         let keyhive = make_keyhive().await;
         let peer_id = keyhive_peer_id(&keyhive);
-        let cc = keyhive.contact_card().await.unwrap();
-        let group = keyhive.generate_group(vec![]).await.unwrap();
+        let cc = keyhive.generate_contact_card().await.unwrap();
+        // The group's founding event is the precondition for the crash window below;
+        // the handle itself is `Copy` and holds no lock, so the call is the whole effect.
+        keyhive.generate_group(vec![]).await.unwrap();
 
         let storage = MemoryKeyhiveStorage::new();
         // Crash window: an incorporated founding event was persisted to the
@@ -3113,16 +4191,12 @@ mod tests {
             KeyOp::Add(op) => StaticEvent::PrekeysExpanded(Box::new(op.as_ref().clone())),
             KeyOp::Rotate(op) => StaticEvent::PrekeyRotated(Box::new(op.as_ref().clone())),
         };
-        drop(group);
         let hash: EventHash = *Digest::hash(&event).raw.as_bytes();
         let event_bytes = bincode_serialize(&event).unwrap();
-        let (stored_hash, inserted) = storage_ops::save_event_bytes::<_, Local>(
-            &storage,
-            event_bytes.clone(),
-            None,
-        )
-        .await
-        .unwrap();
+        let (stored_hash, inserted) =
+            storage_ops::save_event_bytes::<_, Local>(&storage, event_bytes.clone(), None)
+                .await
+                .unwrap();
         assert!(inserted);
         assert_eq!(*stored_hash.as_bytes(), hash);
 
@@ -3134,10 +4208,7 @@ mod tests {
             .unwrap();
 
         let sink = RecordingSink::new();
-        sink.unadmitted
-            .lock()
-            .await
-            .push((hash, event_bytes, None));
+        sink.unadmitted.lock().await.push((hash, event_bytes, None));
         let protocol = TestProtocol::new(Arc::new(keyhive), storage, peer_id, cc)
             .with_durable_incorporation_sink(sink.clone());
 
@@ -3163,7 +4234,7 @@ mod tests {
     async fn boot_reconciliation_skips_pending_candidates() {
         let keyhive = make_keyhive().await;
         let peer_id = keyhive_peer_id(&keyhive);
-        let cc = keyhive.contact_card().await.unwrap();
+        let cc = keyhive.generate_contact_card().await.unwrap();
 
         // A candidate whose dependencies are missing stays pending after
         // replay; it is unadmitted but not incorporated, so it must not be
@@ -3174,7 +4245,11 @@ mod tests {
             .await
             .unwrap();
         let pending_operation = {
-            let document = remote_doc.lock().await;
+            let document = remote
+                .get_document(remote_doc)
+                .await
+                .expect("generated document is present");
+            let document = document.lock().await;
             document
                 .cgka_ops()
                 .unwrap()
@@ -3191,13 +4266,9 @@ mod tests {
         let pending_bytes = bincode_serialize(&pending_event).unwrap();
         let source = Some(keyhive_peer_id(&remote));
         let storage = MemoryKeyhiveStorage::new();
-        storage_ops::save_event_bytes::<_, Local>(
-            &storage,
-            pending_bytes.clone(),
-            source.clone(),
-        )
-        .await
-        .unwrap();
+        storage_ops::save_event_bytes::<_, Local>(&storage, pending_bytes.clone(), source.clone())
+            .await
+            .unwrap();
 
         let sink = RecordingSink::new();
         sink.unadmitted
@@ -3221,7 +4292,7 @@ mod tests {
             Arc::new(keyhive.clone()),
             MemoryKeyhiveStorage::new(),
             keyhive_peer_id(&keyhive),
-            keyhive.contact_card().await.unwrap(),
+            keyhive.generate_contact_card().await.unwrap(),
         )
         .with_durable_incorporation_sink(sink.clone());
 
@@ -3243,15 +4314,13 @@ mod tests {
         let remote_card = remote.get_existing_contact_card().await;
         keyhive.receive_contact_card(&remote_card).await.unwrap();
         let other_card = other.get_existing_contact_card().await;
-        let (KeyOp::Add(remote_add), KeyOp::Add(other_add)) =
-            (remote_card.op(), other_card.op())
+        let (KeyOp::Add(remote_add), KeyOp::Add(other_add)) = (remote_card.op(), other_card.op())
         else {
             panic!("fresh contact cards must contain add-key operations");
         };
         let mut invalid_add = remote_add.as_ref().clone();
         invalid_add.signature = other_add.signature;
-        let event: StaticEvent<[u8; 32]> =
-            StaticEvent::PrekeysExpanded(Box::new(invalid_add));
+        let event: StaticEvent<[u8; 32]> = StaticEvent::PrekeysExpanded(Box::new(invalid_add));
         let hash = *Digest::hash(&event).raw.as_bytes();
         let bytes = bincode_serialize(&event).unwrap();
         let source = Some(keyhive_peer_id(&remote));
@@ -3260,15 +4329,12 @@ mod tests {
             .await
             .unwrap();
         let sink = RecordingSink::new();
-        sink.unadmitted
-            .lock()
-            .await
-            .push((hash, bytes, source));
+        sink.unadmitted.lock().await.push((hash, bytes, source));
         let protocol = TestProtocol::new(
             Arc::new(keyhive.clone()),
             storage,
             keyhive_peer_id(&keyhive),
-            keyhive.contact_card().await.unwrap(),
+            keyhive.generate_contact_card().await.unwrap(),
         )
         .with_durable_incorporation_sink(sink);
 
@@ -3291,7 +4357,7 @@ mod tests {
             Arc::new(keyhive.clone()),
             storage,
             peer_id,
-            keyhive.contact_card().await.unwrap(),
+            keyhive.generate_contact_card().await.unwrap(),
         )
         .with_durable_incorporation_sink(sink.clone());
 
@@ -3309,15 +4375,24 @@ mod tests {
         let remote = make_keyhive().await;
         let remote_id = keyhive_peer_id(&remote);
         protocol
-            .ingest_contact_card(&remote.contact_card().await.unwrap(), Some(remote_id.clone()))
+            .ingest_contact_card(
+                &remote.generate_contact_card().await.unwrap(),
+                Some(remote_id.clone()),
+            )
             .await
             .unwrap();
 
         let reports = sink.reports.lock().await;
-        assert!(reports.iter().any(|(hashes, source)| !hashes.is_empty() && source.is_none()));
-        assert!(reports
-            .iter()
-            .any(|(hashes, source)| !hashes.is_empty() && source.as_ref() == Some(&remote_id)));
+        assert!(
+            reports
+                .iter()
+                .any(|(hashes, source)| !hashes.is_empty() && source.is_none())
+        );
+        assert!(
+            reports
+                .iter()
+                .any(|(hashes, source)| !hashes.is_empty() && source.as_ref() == Some(&remote_id))
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -3341,15 +4416,15 @@ mod tests {
         let (group_id, bob_individual_id) = {
             let kh = alice_kh.clone();
             let group = kh.generate_group(vec![]).await.unwrap();
-            let group_id = group.lock().await.group_id();
+            let group_id = group;
 
             // Get Bob's Individual on Alice's keyhive
             let bob_identifier = bob_id.to_identifier().unwrap();
             let bob_agent = kh.get_agent(bob_identifier).await.unwrap();
 
             kh.add_member(
-                bob_agent,
-                &Membered::Group(group_id, group.clone()),
+                bob_agent.id(),
+                MemberedId::GroupId(group_id),
                 Access::Read,
                 &[],
             )
@@ -3386,10 +4461,8 @@ mod tests {
             let group = kh.get_group(group_id).await;
             assert!(group.is_some(), "Bob should have the group after sync");
 
-            let group_ref = group.unwrap();
-            let members = kh
-                .reachable_members(Membered::Group(group_id, group_ref))
-                .await;
+            let members = kh.reachable_members(group_id).await;
+
             assert!(
                 members.contains_key(&bob_individual_id),
                 "Bob should be a member of the group"
@@ -3414,28 +4487,26 @@ mod tests {
         let doc_id = {
             let kh = alice_kh.clone();
             let group = kh.generate_group(vec![]).await.unwrap();
-            let group_id = group.lock().await.group_id();
+            let group_id = group;
 
             let bob_identifier = bob_id.to_identifier().unwrap();
             let bob_agent = kh.get_agent(bob_identifier).await.unwrap();
 
             kh.add_member(
-                bob_agent,
-                &Membered::Group(group_id, group.clone()),
+                bob_agent.id(),
+                MemberedId::GroupId(group_id),
                 Access::Read,
                 &[],
             )
             .await
             .unwrap();
 
-            let doc = kh
-                .generate_doc(
-                    vec![Peer::Group(group_id, group.clone())],
-                    nonempty![[0u8; 32]],
-                )
-                .await
-                .unwrap();
-            doc.lock().await.doc_id()
+            kh.generate_doc(
+                vec![Identifier::from(MemberedId::GroupId(group_id))],
+                nonempty![[0u8; 32]],
+            )
+            .await
+            .unwrap()
         };
 
         // Before sync: Bob should not have the document
@@ -3561,8 +4632,8 @@ mod tests {
                 .await
                 .unwrap();
 
-            let alice_ops = alice.membership_ops_for_agent(&alice_self).await;
-            let bob_ops = bob.membership_ops_for_agent(&bob_self).await;
+            let alice_ops = alice.membership_ops_for_agent(alice_self.id()).await;
+            let bob_ops = bob.membership_ops_for_agent(bob_self.id()).await;
             assert_eq!(
                 alice_ops.len(),
                 bob_ops.len(),
@@ -3596,14 +4667,14 @@ mod tests {
         let group_id = {
             let kh = alice_kh.clone();
             let group = kh.generate_group(vec![]).await.unwrap();
-            let group_id = group.lock().await.group_id();
+            let group_id = group;
 
             let bob_identifier = bob_id.to_identifier().unwrap();
             let bob_agent = kh.get_agent(bob_identifier).await.unwrap();
 
             kh.add_member(
-                bob_agent,
-                &Membered::Group(group_id, group.clone()),
+                bob_agent.id(),
+                MemberedId::GroupId(group_id),
                 Access::Read,
                 &[],
             )
@@ -3656,10 +4727,10 @@ mod tests {
         // Alice revokes Bob from the group
         {
             let kh = alice_kh.clone();
-            let group = kh.get_group(group_id).await.unwrap();
+            let _group = kh.get_group(group_id).await.unwrap();
             let bob_identifier = bob_id.to_identifier().unwrap();
 
-            kh.revoke_member(bob_identifier, true, &Membered::Group(group_id, group))
+            kh.revoke_member(bob_identifier, true, MemberedId::GroupId(group_id))
                 .await
                 .unwrap();
         };
@@ -3795,9 +4866,8 @@ mod tests {
             );
 
             let carol_identifier = carol_id.to_identifier().unwrap();
-            let members = kh
-                .reachable_members(Membered::Group(group_id, group.unwrap()))
-                .await;
+            let members = kh.reachable_members(group_id).await;
+
             assert!(
                 members.contains_key(&carol_identifier),
                 "Carol should be a member of the group"
@@ -4390,7 +5460,7 @@ mod tests {
     async fn fresh_client_gets_complete_deps_after_revocation_chain() {
         use keyhive_core::{
             access::Access,
-            principal::{agent::Agent, membered::Membered, public::Public},
+            principal::{membered::Membered, public::Public},
         };
 
         let kh_a = make_keyhive().await;
@@ -4415,9 +5485,13 @@ mod tests {
             .generate_doc(vec![], nonempty![[0u8; 32]])
             .await
             .unwrap();
-        let doc_id = doc.lock().await.doc_id();
+        let doc_id = doc;
+        let doc = kh_a
+            .get_document(doc_id)
+            .await
+            .expect("generated document is present");
         let membered = Membered::Document(doc_id, doc.clone());
-        let public_agent: Agent<_, _, _, _> = Public.individual().into();
+        let public_agent = Public;
 
         let (a_proto, a_kh, _) = make_protocol_with_shared_keyhive(kh_a).await;
         let (b_proto, _b_kh, _) = make_protocol_with_shared_keyhive(kh_b).await;
@@ -4468,40 +5542,35 @@ mod tests {
         sync_a_server!();
 
         {
-            a_kh
-                .add_member(public_agent.clone(), &membered, Access::Edit, &[])
+            a_kh.add_member(public_agent.id(), membered.membered_id(), Access::Edit, &[])
                 .await
                 .unwrap();
         }
         sync_a_server!();
         sync_b_server!();
         {
-            a_kh
-                .revoke_member(Public.id(), true, &membered)
+            a_kh.revoke_member(Public.id(), true, membered.membered_id())
                 .await
                 .unwrap();
         }
         sync_a_server!();
         sync_b_server!();
         {
-            a_kh
-                .add_member(b_agent, &membered, Access::Edit, &[])
+            a_kh.add_member(b_agent.id(), membered.membered_id(), Access::Edit, &[])
                 .await
                 .unwrap();
         }
         sync_a_server!();
         sync_b_server!();
         {
-            a_kh
-                .revoke_member(b_identifier, true, &membered)
+            a_kh.revoke_member(b_identifier, true, membered.membered_id())
                 .await
                 .unwrap();
         }
         sync_a_server!();
         sync_b_server!();
         {
-            a_kh
-                .add_member(public_agent.clone(), &membered, Access::Edit, &[])
+            a_kh.add_member(public_agent.id(), membered.membered_id(), Access::Edit, &[])
                 .await
                 .unwrap();
         }
@@ -4573,9 +5642,7 @@ mod tests {
     /// through the protocol.
     #[tokio::test(flavor = "current_thread")]
     async fn all_agent_events_complete_after_protocol_sync() {
-        use keyhive_core::principal::{
-            agent::Agent, identifier::Identifier, membered::Membered, public::Public,
-        };
+        use keyhive_core::principal::{identifier::Identifier, membered::Membered, public::Public};
 
         let kh_a = make_keyhive().await;
         let kh_b = make_keyhive().await;
@@ -4596,9 +5663,13 @@ mod tests {
             .generate_doc(vec![], nonempty![[0u8; 32]])
             .await
             .unwrap();
-        let doc_id = doc.lock().await.doc_id();
+        let doc_id = doc;
+        let doc = kh_a
+            .get_document(doc_id)
+            .await
+            .expect("generated document is present");
         let membered = Membered::Document(doc_id, doc.clone());
-        let public_agent: Agent<_, _, _, _> = Public.individual().into();
+        let public_agent = Public;
 
         let (a_proto, a_kh, _) = make_protocol_with_shared_keyhive(kh_a).await;
         let (b_proto, _b_kh, _) = make_protocol_with_shared_keyhive(kh_b).await;
@@ -4647,40 +5718,35 @@ mod tests {
 
         sync_a_server!();
         {
-            a_kh
-                .add_member(public_agent.clone(), &membered, Access::Edit, &[])
+            a_kh.add_member(public_agent.id(), membered.membered_id(), Access::Edit, &[])
                 .await
                 .unwrap();
         }
         sync_a_server!();
         sync_b_server!();
         {
-            a_kh
-                .revoke_member(Public.id(), true, &membered)
+            a_kh.revoke_member(Public.id(), true, membered.membered_id())
                 .await
                 .unwrap();
         }
         sync_a_server!();
         sync_b_server!();
         {
-            a_kh
-                .add_member(b_agent, &membered, Access::Edit, &[])
+            a_kh.add_member(b_agent.id(), membered.membered_id(), Access::Edit, &[])
                 .await
                 .unwrap();
         }
         sync_a_server!();
         sync_b_server!();
         {
-            a_kh
-                .revoke_member(b_identifier, true, &membered)
+            a_kh.revoke_member(b_identifier, true, membered.membered_id())
                 .await
                 .unwrap();
         }
         sync_a_server!();
         sync_b_server!();
         {
-            a_kh
-                .add_member(public_agent.clone(), &membered, Access::Edit, &[])
+            a_kh.add_member(public_agent.id(), membered.membered_id(), Access::Edit, &[])
                 .await
                 .unwrap();
         }
@@ -4722,9 +5788,7 @@ mod tests {
     /// Doc 4: full chain: make public → revoke → add B → revoke B → make public.
     #[tokio::test(flavor = "current_thread")]
     async fn all_agent_events_complete_multiple_docs() {
-        use keyhive_core::principal::{
-            agent::Agent, identifier::Identifier, membered::Membered, public::Public,
-        };
+        use keyhive_core::principal::{identifier::Identifier, membered::Membered, public::Public};
 
         let kh_a = make_keyhive().await;
         let kh_b = make_keyhive().await;
@@ -4759,15 +5823,27 @@ mod tests {
             .await
             .unwrap();
 
-        let doc2_id = doc2.lock().await.doc_id();
-        let doc3_id = doc3.lock().await.doc_id();
-        let doc4_id = doc4.lock().await.doc_id();
+        let doc2_id = doc2;
+        let doc2 = kh_a
+            .get_document(doc2_id)
+            .await
+            .expect("generated document is present");
+        let doc3_id = doc3;
+        let doc3 = kh_a
+            .get_document(doc3_id)
+            .await
+            .expect("generated document is present");
+        let doc4_id = doc4;
+        let doc4 = kh_a
+            .get_document(doc4_id)
+            .await
+            .expect("generated document is present");
 
         let membered2 = Membered::Document(doc2_id, doc2.clone());
         let membered3 = Membered::Document(doc3_id, doc3.clone());
         let membered4 = Membered::Document(doc4_id, doc4.clone());
 
-        let public_agent: Agent<_, _, _, _> = Public.individual().into();
+        let public_agent = Public;
 
         let (a_proto, a_kh, _) = make_protocol_with_shared_keyhive(kh_a).await;
         let (b_proto, _b_kh, _) = make_protocol_with_shared_keyhive(kh_b).await;
@@ -4819,26 +5895,33 @@ mod tests {
 
         // Doc 2: make public, never revoke.
         {
-            a_kh
-                .add_member(public_agent.clone(), &membered2, Access::Edit, &[])
-                .await
-                .unwrap();
+            a_kh.add_member(
+                public_agent.id(),
+                membered2.membered_id(),
+                Access::Edit,
+                &[],
+            )
+            .await
+            .unwrap();
         }
         sync_a_server!();
         sync_b_server!();
 
         // Doc 3: make public then revoke.
         {
-            a_kh
-                .add_member(public_agent.clone(), &membered3, Access::Edit, &[])
-                .await
-                .unwrap();
+            a_kh.add_member(
+                public_agent.id(),
+                membered3.membered_id(),
+                Access::Edit,
+                &[],
+            )
+            .await
+            .unwrap();
         }
         sync_a_server!();
         sync_b_server!();
         {
-            a_kh
-                .revoke_member(Public.id(), true, &membered3)
+            a_kh.revoke_member(Public.id(), true, membered3.membered_id())
                 .await
                 .unwrap();
         }
@@ -4847,42 +5930,47 @@ mod tests {
 
         // Doc 4: full chain.
         {
-            a_kh
-                .add_member(public_agent.clone(), &membered4, Access::Edit, &[])
+            a_kh.add_member(
+                public_agent.id(),
+                membered4.membered_id(),
+                Access::Edit,
+                &[],
+            )
+            .await
+            .unwrap();
+        }
+        sync_a_server!();
+        sync_b_server!();
+        {
+            a_kh.revoke_member(Public.id(), true, membered4.membered_id())
                 .await
                 .unwrap();
         }
         sync_a_server!();
         sync_b_server!();
         {
-            a_kh
-                .revoke_member(Public.id(), true, &membered4)
+            a_kh.add_member(b_agent.id(), membered4.membered_id(), Access::Edit, &[])
                 .await
                 .unwrap();
         }
         sync_a_server!();
         sync_b_server!();
         {
-            a_kh
-                .add_member(b_agent, &membered4, Access::Edit, &[])
+            a_kh.revoke_member(b_identifier, true, membered4.membered_id())
                 .await
                 .unwrap();
         }
         sync_a_server!();
         sync_b_server!();
         {
-            a_kh
-                .revoke_member(b_identifier, true, &membered4)
-                .await
-                .unwrap();
-        }
-        sync_a_server!();
-        sync_b_server!();
-        {
-            a_kh
-                .add_member(public_agent.clone(), &membered4, Access::Edit, &[])
-                .await
-                .unwrap();
+            a_kh.add_member(
+                public_agent.id(),
+                membered4.membered_id(),
+                Access::Edit,
+                &[],
+            )
+            .await
+            .unwrap();
         }
         sync_a_server!();
         sync_b_server!();
@@ -4915,9 +6003,7 @@ mod tests {
     /// associated with revoked agents.
     #[tokio::test(flavor = "current_thread")]
     async fn all_agent_events_includes_cgka_ops_after_revocation() {
-        use keyhive_core::principal::{
-            agent::Agent, identifier::Identifier, membered::Membered, public::Public,
-        };
+        use keyhive_core::principal::{identifier::Identifier, membered::Membered, public::Public};
 
         let kh_a = make_keyhive().await;
         let kh_b = make_keyhive().await;
@@ -4938,9 +6024,13 @@ mod tests {
             .generate_doc(vec![], nonempty![[0u8; 32]])
             .await
             .unwrap();
-        let doc_id = doc.lock().await.doc_id();
+        let doc_id = doc;
+        let doc = kh_a
+            .get_document(doc_id)
+            .await
+            .expect("generated document is present");
         let membered = Membered::Document(doc_id, doc.clone());
-        let public_agent: Agent<_, _, _, _> = Public.individual().into();
+        let public_agent = Public;
 
         let (a_proto, a_kh, _) = make_protocol_with_shared_keyhive(kh_a).await;
         let (b_proto, _b_kh, _) = make_protocol_with_shared_keyhive(kh_b).await;
@@ -4992,40 +6082,35 @@ mod tests {
 
         sync_a_server!();
         {
-            a_kh
-                .add_member(public_agent.clone(), &membered, Access::Edit, &[])
+            a_kh.add_member(public_agent.id(), membered.membered_id(), Access::Edit, &[])
                 .await
                 .unwrap();
         }
         sync_a_server!();
         sync_b_server!();
         {
-            a_kh
-                .revoke_member(Public.id(), true, &membered)
+            a_kh.revoke_member(Public.id(), true, membered.membered_id())
                 .await
                 .unwrap();
         }
         sync_a_server!();
         sync_b_server!();
         {
-            a_kh
-                .add_member(b_agent, &membered, Access::Edit, &[])
+            a_kh.add_member(b_agent.id(), membered.membered_id(), Access::Edit, &[])
                 .await
                 .unwrap();
         }
         sync_a_server!();
         sync_b_server!();
         {
-            a_kh
-                .revoke_member(b_identifier, true, &membered)
+            a_kh.revoke_member(b_identifier, true, membered.membered_id())
                 .await
                 .unwrap();
         }
         sync_a_server!();
         sync_b_server!();
         {
-            a_kh
-                .add_member(public_agent.clone(), &membered, Access::Edit, &[])
+            a_kh.add_member(public_agent.id(), membered.membered_id(), Access::Edit, &[])
                 .await
                 .unwrap();
         }
@@ -5215,7 +6300,7 @@ mod protocol_behavioural {
         alice_kh.generate_group(vec![]).await.unwrap();
         alice_proto.refresh_cache().await.unwrap();
         let remote = crate::test_utils::make_keyhive().await;
-        let remote_card = remote.contact_card().await.unwrap();
+        let remote_card = remote.generate_contact_card().await.unwrap();
 
         // Make the cache dirty, then prevent its walk from completing while a
         // second structural mutation advances the generation.
@@ -5228,7 +6313,9 @@ mod protocol_behavioural {
         refresh.await.unwrap();
 
         assert_eq!(
-            alice_proto.snapshot_state_generation.load(Ordering::Acquire),
+            alice_proto
+                .snapshot_state_generation
+                .load(Ordering::Acquire),
             alice_kh.state_generation(),
             "a rebuild raced by mutation must retry instead of labeling stale data current"
         );
@@ -5614,7 +6701,9 @@ mod protocol_behavioural {
         drop(drain_channel(&bob_conn, &alice_id));
 
         // Before refresh: cache is stale (doesn't reflect Bob's new ops).
-        let stale_gen = alice_proto.snapshot_state_generation.load(Ordering::Acquire);
+        let stale_gen = alice_proto
+            .snapshot_state_generation
+            .load(Ordering::Acquire);
 
         // refresh_cache on demand should bring the cache current.
         alice_proto
@@ -5622,7 +6711,9 @@ mod protocol_behavioural {
             .await
             .expect("on-demand refresh");
 
-        let fresh_gen = alice_proto.snapshot_state_generation.load(Ordering::Acquire);
+        let fresh_gen = alice_proto
+            .snapshot_state_generation
+            .load(Ordering::Acquire);
         let current_gen = alice_proto.keyhive.state_generation();
         assert_eq!(
             fresh_gen, current_gen,
@@ -5727,7 +6818,9 @@ mod protocol_behavioural {
 
         // The cache must be fully current after handle_message returns.
         let gen_after_handle = alice_proto.keyhive.state_generation();
-        let pub_after_handle = alice_proto.snapshot_state_generation.load(Ordering::Acquire);
+        let pub_after_handle = alice_proto
+            .snapshot_state_generation
+            .load(Ordering::Acquire);
         assert_eq!(
             pub_after_handle, gen_after_handle,
             "cache is current after handle_message (published == generation)"

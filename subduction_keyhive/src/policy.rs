@@ -627,4 +627,251 @@ mod tests {
             assert_eq!(id1, id2);
         }
     }
+
+    /// The `authorize_put_with` boundary against a real keyhive.
+    ///
+    /// The conversion tests above are pure functions; these drive the decision itself, because the
+    /// decision is what a sync session's put is gated on and nothing exercised it before.
+    mod authorize_put {
+        use super::*;
+        use alloc::collections::BTreeSet;
+        use keyhive_core::{
+            listener::no_listener::NoListener, principal::membered::id::MemberedId,
+            store::ciphertext::memory::MemoryCiphertextStore,
+        };
+        use keyhive_crypto::signer::memory::MemorySigner as HiveSigner;
+        use nonempty::nonempty;
+        use rand::rngs::OsRng;
+        use sedimentree_core::{
+            blob::{Blob, BlobMeta},
+            loose_commit::{LooseCommit, id::CommitId},
+        };
+        use subduction_crypto::{signed::Signed, signer::memory::MemorySigner as CommitSigner};
+
+        /// A hive whose active signer this test controls.
+        ///
+        /// `crate::test_utils::make_keyhive` generates a random signer, and a `VerifiedAuthor` can
+        /// only be minted for a key we hold the secret of — so a random hive's own member could
+        /// never be the author of a put in a test.
+        async fn hive_from_seed(seed: u8) -> crate::test_utils::SimpleKeyhive {
+            Keyhive::generate(
+                HiveSigner::from(ed25519_dalek::SigningKey::from_bytes(&[seed; 32])),
+                MemoryCiphertextStore::new(),
+                NoListener,
+                OsRng,
+            )
+            .await
+            .expect("keyhive")
+        }
+
+        /// Mint the only kind of [`VerifiedAuthor`] that can exist: one extracted from a
+        /// signature that was actually verified.
+        ///
+        /// Seed `0x00` is `Public`'s well-known signing key (`Public::signing_key`), so an author
+        /// for the public principal is mintable the same way as any other.
+        async fn author_for(seed: u8) -> VerifiedAuthor {
+            let signer = CommitSigner::from_bytes(&[seed; 32]);
+            let blob = Blob::new(alloc::vec![seed]);
+            let commit = LooseCommit::new(
+                SedimentreeId::new([seed; 32]),
+                CommitId::new([seed; 32]),
+                BTreeSet::new(),
+                BlobMeta::new(&blob),
+            );
+            Signed::seal::<Local, _>(&signer, commit)
+                .await
+                .verified_author()
+        }
+
+        /// An owned document, plus the sedimentree id the policy resolves back to it.
+        async fn document_of(
+            hive: &crate::test_utils::SimpleKeyhive,
+        ) -> (DocumentId, SedimentreeId) {
+            let doc_id = hive
+                .generate_doc(vec![], nonempty![[0u8; 32]])
+                .await
+                .expect("generate_doc");
+            (doc_id, SedimentreeId::new(*doc_id.as_bytes()))
+        }
+
+        /// Let each hive learn the other's key ops, the way a first contact does.
+        async fn exchange_cards(
+            a: &crate::test_utils::SimpleKeyhive,
+            b: &crate::test_utils::SimpleKeyhive,
+        ) {
+            let a_card = a.generate_contact_card().await.expect("a card");
+            let b_card = b.generate_contact_card().await.expect("b card");
+            a.receive_contact_card(&b_card).await.expect("a <- b");
+            b.receive_contact_card(&a_card).await.expect("b <- a");
+        }
+
+        /// The put decision is about the commit's **signed author**, never about the peer that
+        /// handed the bytes over.
+        ///
+        /// The asymmetry is deliberate and load bearing: a relay carries other people's commits
+        /// and often has no access to the documents it forwards, so judging the sender would refuse
+        /// every relayed write outright. The `_requestor` parameter is discarded by name, which
+        /// makes "fix" it to use the sender an easy and plausible-looking mistake — and nothing
+        /// pinned the behaviour before this test.
+        #[tokio::test(flavor = "current_thread")]
+        async fn authorize_put_judges_the_signed_author_not_the_transmitting_peer() {
+            let alice = hive_from_seed(0xAA).await;
+            let carol = hive_from_seed(0xCC).await;
+            exchange_cards(&alice, &carol).await;
+
+            let carol_identifier: Identifier = carol.id().into();
+            let (doc_id, sedimentree_id) = document_of(&alice).await;
+            alice
+                .add_member(
+                    carol_identifier,
+                    MemberedId::DocumentId(doc_id),
+                    Access::Edit,
+                    &[],
+                )
+                .await
+                .expect("add carol as an editor");
+
+            // A relay with no access to the document at all transmits an editor's commit.
+            let relay = PeerId::new([0x11; 32]);
+            assert!(
+                authorize_put_with(&alice, relay, author_for(0xCC).await, sedimentree_id)
+                    .await
+                    .is_ok(),
+                "an editor's commit must be accepted through a requestor that has no access"
+            );
+
+            // The inverse: the requestor is the editor, and the author is someone the document has
+            // never heard of. Denied — the check must not fall back to the sender.
+            assert_eq!(
+                authorize_put_with(
+                    &alice,
+                    PeerId::new(*carol_identifier.as_bytes()),
+                    author_for(0xDD).await,
+                    sedimentree_id
+                )
+                .await,
+                Err(PutDisallowedError::InsufficientAccess),
+                "an unknown author must be refused even when the sender is a member"
+            );
+        }
+
+        /// Negative control pairing with the `Public`/`Edit` shortcut: `Read` is not enough to
+        /// write, so a reader's commit must be refused rather than merely discouraged.
+        #[tokio::test(flavor = "current_thread")]
+        async fn authorize_put_denies_a_reader_only_author() {
+            let alice = hive_from_seed(0xAA).await;
+            let carol = hive_from_seed(0xCC).await;
+            exchange_cards(&alice, &carol).await;
+
+            let carol_identifier: Identifier = carol.id().into();
+            let (doc_id, sedimentree_id) = document_of(&alice).await;
+            alice
+                .add_member(
+                    carol_identifier,
+                    MemberedId::DocumentId(doc_id),
+                    Access::Read,
+                    &[],
+                )
+                .await
+                .expect("add carol as a reader");
+
+            assert_eq!(
+                authorize_put_with(
+                    &alice,
+                    PeerId::new([0x11; 32]),
+                    author_for(0xCC).await,
+                    sedimentree_id
+                )
+                .await,
+                Err(PutDisallowedError::InsufficientAccess),
+                "a reader must not be able to put"
+            );
+        }
+
+        /// A document that has been made public accepts commits authored by the well-known public
+        /// key.
+        ///
+        /// This is the branch that makes public documents work at all; it is invisible in every
+        /// private-document test, and cheap to cover.
+        #[tokio::test(flavor = "current_thread")]
+        async fn authorize_put_accepts_public_with_edit() {
+            let alice = hive_from_seed(0xAA).await;
+            let (doc_id, sedimentree_id) = document_of(&alice).await;
+            alice
+                .add_member(
+                    Public.id(),
+                    MemberedId::DocumentId(doc_id),
+                    Access::Edit,
+                    &[],
+                )
+                .await
+                .expect("make the document public");
+
+            // Seed 0x00 is the public principal's signing key, so this is the public author.
+            assert!(
+                authorize_put_with(
+                    &alice,
+                    PeerId::new([0x11; 32]),
+                    author_for(0x00).await,
+                    sedimentree_id
+                )
+                .await
+                .is_ok(),
+                "a public document must accept public commits"
+            );
+        }
+
+        /// A revocation must not retroactively invalidate a commit that was authored while `Edit`
+        /// was valid.
+        ///
+        /// Deliberately red today. The policy resolves the document's *current*
+        /// `transitive_members` and checks the author against that, so as soon as the revocation
+        /// lands the very author who held `Edit` when the commit was made is refused. Neither a
+        /// retry nor an "ever had Edit" relaxation fixes it: the signed Sedimentree commit carries
+        /// an identity but no causal authorization witness, so authorization has to be evaluated
+        /// at the commit's own causal point. The assertion below is the specification for that
+        /// semantics — it is ignored, not weakened, and it must be demonstrated red by running it
+        /// explicitly.
+        #[tokio::test(flavor = "current_thread")]
+        #[ignore = "requires a causal authorization witness bound to the signed commit"]
+        async fn authorize_put_accepts_a_commit_authored_before_a_concurrent_revocation() {
+            let alice = hive_from_seed(0xAA).await;
+            let carol = hive_from_seed(0xCC).await;
+            exchange_cards(&alice, &carol).await;
+
+            let carol_identifier: Identifier = carol.id().into();
+            let (doc_id, sedimentree_id) = document_of(&alice).await;
+            alice
+                .add_member(
+                    carol_identifier,
+                    MemberedId::DocumentId(doc_id),
+                    Access::Edit,
+                    &[],
+                )
+                .await
+                .expect("add carol as an editor");
+
+            // The commit Carol authored offline, while her Edit grant was valid.
+            let author = author_for(0xCC).await;
+            assert!(
+                authorize_put_with(&alice, PeerId::new([0x11; 32]), author, sedimentree_id)
+                    .await
+                    .is_ok(),
+                "baseline: the author is an editor before the revocation"
+            );
+
+            alice
+                .revoke_member(carol_identifier, true, MemberedId::DocumentId(doc_id))
+                .await
+                .expect("revoke carol");
+
+            assert!(
+                authorize_put_with(&alice, PeerId::new([0x11; 32]), author, sedimentree_id)
+                    .await
+                    .is_ok(),
+                "a revocation must not retroactively invalidate a commit authored while Edit was \
+                 valid"
+            );
+        }
+    }
 }

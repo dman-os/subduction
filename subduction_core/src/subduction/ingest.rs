@@ -174,6 +174,13 @@ pub(crate) async fn recv_batch_sync_response<
         let author = verified_meta.verified_author();
         let author_id = PeerId::from(*author.verifying_key());
 
+        // The cache is keyed by the author alone, so authorization runs once per (batch, author) and
+        // the requestor it was performed for is whichever sender this author was first seen from.
+        // That is sound only while `authorize_put_with` ignores the requestor; the moment the
+        // requestor/`Access::Relay` check proposed at `subduction_keyhive::policy`'s
+        // `authorize_put_with` TODO is implemented, this cache would bypass the policy for every
+        // later sender in the batch. Whoever implements it must add the requestor to this key (or
+        // state why it cannot matter).
         #[allow(clippy::map_entry)]
         if !putter_cache.contains_key(&author_id) {
             match storage.get_putter::<Async>(*from, author, id).await {
@@ -184,6 +191,7 @@ pub(crate) async fn recv_batch_sync_response<
                     tracing::warn!(
                         peer = %from,
                         author = ?author,
+                        commit_id = ?commit_id,
                         tree = ?id,
                         error = %e,
                         "policy rejected commit"
@@ -245,6 +253,7 @@ pub(crate) async fn recv_batch_sync_response<
                     tracing::warn!(
                         peer = %from,
                         author = ?author,
+                        fragment_id = ?fragment_id,
                         tree = ?id,
                         error = %e,
                         "policy rejected fragment"

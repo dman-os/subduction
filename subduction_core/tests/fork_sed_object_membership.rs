@@ -131,7 +131,8 @@ async fn child_boot_commit_with_parent_wire_id_is_not_admitted_into_parent_sed()
         b[0] = 0xAA;
         b
     };
-    let (parent_tip, parent_blob) = make_signed_commit(parent_sed, parent_tip_id, BTreeSet::new()).await;
+    let (parent_tip, parent_blob) =
+        make_signed_commit(parent_sed, parent_tip_id, BTreeSet::new()).await;
     handle
         .inbound_tx
         .send(SyncMessage::LooseCommit {
@@ -153,7 +154,9 @@ async fn child_boot_commit_with_parent_wire_id_is_not_admitted_into_parent_sed()
     let (child_boot, child_boot_blob) = make_signed_commit(
         child_sed,
         child_boot_id,
-        BTreeSet::from([sedimentree_core::loose_commit::id::CommitId::new(parent_tip_id)]),
+        BTreeSet::from([sedimentree_core::loose_commit::id::CommitId::new(
+            parent_tip_id,
+        )]),
     )
     .await;
     handle
@@ -175,7 +178,9 @@ async fn child_boot_commit_with_parent_wire_id_is_not_admitted_into_parent_sed()
         .unwrap_or_default();
 
     assert!(
-        !parent_heads.contains(&sedimentree_core::loose_commit::id::CommitId::new(child_boot_id)),
+        !parent_heads.contains(&sedimentree_core::loose_commit::id::CommitId::new(
+            child_boot_id
+        )),
         "parent_sed admitted the child boot commit delivered under its wire id \
          (object membership violated: receive path trusted the message id instead of the \
           commit's payload sedimentree_id — the fork-sedimentree corruption bug)\n\
@@ -240,7 +245,9 @@ async fn child_boot_fragment_with_parent_wire_id_is_not_admitted_into_parent_sed
         .unwrap_or_default();
 
     assert!(
-        !parent_frag_heads.contains(&sedimentree_core::loose_commit::id::CommitId::new(frag_head)),
+        !parent_frag_heads.contains(&sedimentree_core::loose_commit::id::CommitId::new(
+            frag_head
+        )),
         "parent_sed admitted the child-bound fragment under S_parent wire id (object membership violated at the fragment boundary too)\n\
          parent_fragments={parent_frag_heads:?}"
     );

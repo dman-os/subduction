@@ -298,7 +298,11 @@ opt-level = 2
 [profile.wasm-debug.package.sedimentree_core]
 opt-level = 2
 
-# [patch."https://github.com/dman-os/keyhive"]
-# keyhive_crypto = { path = "../keyhive/keyhive_crypto" }
-# keyhive_core = { path = "../keyhive/keyhive_core" }
-# beekem = { path = "../keyhive/beekem" }
+# Complete local Keyhive patch: the on-disk fork declares keyhive_core 0.6.0 /
+# beekem 0.4.0, which the remote `rev` pin does not, so an independent fork
+# build resolves every consumed crate from the local checkout. All three
+# entries are required — a partial block silently duplicates crates.
+[patch."https://github.com/dman-os/keyhive"]
+keyhive_crypto = { path = "../keyhive/keyhive_crypto" }
+keyhive_core = { path = "../keyhive/keyhive_core" }
+beekem = { path = "../keyhive/beekem" }

@@ -64,8 +64,7 @@ fn serving_membench() {
     use keyhive_core::{
         access::Access,
         principal::{
-            agent::Agent, identifier::Identifier, individual::op::KeyOp, membered::Membered,
-            public::Public,
+            identifier::Identifier, individual::op::KeyOp, membered::Membered, public::Public,
         },
     };
     use nonempty::nonempty;
@@ -103,7 +102,7 @@ fn serving_membench() {
             peers.push(make_keyhive().await);
         }
         for p in &peers {
-            let cc = p.contact_card().await.expect("contact_card");
+            let cc = p.generate_contact_card().await.expect("contact_card");
             server
                 .receive_contact_card(&cc)
                 .await
@@ -131,11 +130,15 @@ fn serving_membench() {
                 .generate_doc(vec![], nonempty![[fill; 32]])
                 .await
                 .expect("generate_doc");
-            let doc_id = doc.lock().await.doc_id();
+            let doc_id = doc;
+            let doc = server
+                .get_document(doc_id)
+                .await
+                .expect("generated document is present");
             let membered = Membered::Document(doc_id, doc.clone());
-            let public_agent: Agent<_, _, _, _> = Public.individual().into();
+            let public_agent = Public;
             server
-                .add_member(public_agent, &membered, Access::Read, &[])
+                .add_member(public_agent.id(), membered.membered_id(), Access::Read, &[])
                 .await
                 .expect("add public");
             for step in 1..=k.min(n.saturating_sub(1)) {
@@ -146,12 +149,12 @@ fn serving_membench() {
                 let id: Identifier = peers[j].id().into();
                 if let Some(agent) = server.get_agent(id).await {
                     server
-                        .add_member(agent, &membered, Access::Read, &[])
+                        .add_member(agent.id(), membered.membered_id(), Access::Read, &[])
                         .await
                         .expect("add member");
                 }
             }
-            docs.push(doc);
+            docs.push(doc_id);
         }
 
         // Server's own peer id (the `local` side of every served pair),
@@ -176,10 +179,10 @@ fn serving_membench() {
                     break;
                 }
                 let idx = (it * edits + e) % docs.len();
-                let doc = docs[idx].clone();
-                let _op = shared.force_pcs_update(doc).await;
+                let doc_id = docs[idx];
+                let _op = shared.force_pcs_update(doc_id).await;
             }
-            cache.refresh(&proto).await.expect("refresh");    // refresh returns () now
+            cache.refresh(&proto).await.expect("refresh"); // refresh returns () now
             let s = dhat::HeapStats::get();
             eprintln!(
                 "{it:9} | {:7} | {:11.1} | {:7.1}",
@@ -220,7 +223,13 @@ fn serving_membench() {
             let mut per_response = 0;
             for m in 0..serve {
                 let peer = peer_ids[m % peer_ids.len()].clone();
-                let response = cache.events_for_peer_pair(&local, &peer);
+                let PeerPairProjection::Known { events: response } =
+                    cache.events_for_peer_pair(&local, &peer)
+                else {
+                    // The bench serves known peers only: every peer here is a member of the
+                    // server's keyhive and every document is one it granted.
+                    panic!("bench serves a pair that is not in the projection");
+                };
                 per_response = response.len();
                 if serialize {
                     let found_ops: Vec<Arc<[u8]>> = response.values().map(Dupe::dupe).collect();
@@ -287,8 +296,7 @@ fn keyhive_baseline_membench() {
     use keyhive_core::{
         access::Access,
         principal::{
-            agent::Agent, identifier::Identifier, individual::op::KeyOp, membered::Membered,
-            public::Public,
+            identifier::Identifier, individual::op::KeyOp, membered::Membered, public::Public,
         },
     };
     use nonempty::nonempty;
@@ -327,7 +335,7 @@ fn keyhive_baseline_membench() {
         stage!("N client keyhives");
 
         for p in &peers {
-            let cc = p.contact_card().await.expect("contact_card");
+            let cc = p.generate_contact_card().await.expect("contact_card");
             server
                 .receive_contact_card(&cc)
                 .await
@@ -361,11 +369,15 @@ fn keyhive_baseline_membench() {
                 .generate_doc(vec![], nonempty![[fill; 32]])
                 .await
                 .expect("generate_doc");
-            let doc_id = doc.lock().await.doc_id();
+            let doc_id = doc;
+            let doc = server
+                .get_document(doc_id)
+                .await
+                .expect("generated document is present");
             let membered = Membered::Document(doc_id, doc.clone());
-            let public_agent: Agent<_, _, _, _> = Public.individual().into();
+            let public_agent = Public;
             server
-                .add_member(public_agent, &membered, Access::Read, &[])
+                .add_member(public_agent.id(), membered.membered_id(), Access::Read, &[])
                 .await
                 .expect("add public");
             docs.push(membered);
@@ -381,7 +393,7 @@ fn keyhive_baseline_membench() {
                 let id: Identifier = peers[j].id().into();
                 if let Some(agent) = server.get_agent(id).await {
                     server
-                        .add_member(agent, membered, Access::Read, &[])
+                        .add_member(agent.id(), membered.membered_id(), Access::Read, &[])
                         .await
                         .expect("add member");
                 }

@@ -7,8 +7,11 @@ use async_channel::{Receiver, Sender};
 use future_form::Local;
 use futures::{FutureExt, future::LocalBoxFuture};
 use keyhive_core::{
-    access::Access, keyhive::Keyhive, listener::no_listener::NoListener,
-    principal::group::id::GroupId, store::ciphertext::memory::MemoryCiphertextStore,
+    access::Access,
+    keyhive::Keyhive,
+    listener::no_listener::NoListener,
+    principal::{group::id::GroupId, membered::id::MemberedId},
+    store::ciphertext::memory::MemoryCiphertextStore,
 };
 use keyhive_crypto::signer::memory::MemorySigner;
 use rand::rngs::OsRng;
@@ -336,7 +339,9 @@ pub async fn create_group_with_read_members(
     let group_id = kh.generate_group(vec![]).await.expect("generate_group");
     for member_id in member_ids {
         let identifier = member_id.to_identifier().expect("to_identifier");
-        kh.add_member(identifier, group_id, Access::Read, &[])
+        // `add_member` resolves the agent id itself (`agent_by_id`) and fails for an unknown agent,
+        // so the explicit `get_agent` existence check this used to do is redundant.
+        kh.add_member(identifier, MemberedId::GroupId(group_id), Access::Read, &[])
             .await
             .expect("add_member");
     }
@@ -351,7 +356,7 @@ mod nested_chain_sync_repro {
     //! cache freshness now derives from `Keyhive::state_generation`.
 
     use super::*;
-    use keyhive_core::principal::agent::Agent;
+    use keyhive_core::principal::identifier::Identifier;
 
     async fn run_chain() {
         drop(
@@ -380,21 +385,18 @@ mod nested_chain_sync_repro {
             };
             let grant_fut = async {
                 tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-                let doc = harness
+                let doc_id = harness
                     .alice_kh
                     .generate_doc(vec![], nonempty::nonempty![[1u8; 32]])
                     .await
                     .expect("generate doc");
-                let doc_id = doc.lock().await.doc_id();
-                let g1 = harness.alice_kh.generate_group(vec![]).await.expect("g1");
-                let g1_id = g1.lock().await.group_id();
-                let g2 = harness.alice_kh.generate_group(vec![]).await.expect("g2");
-                let g2_id = g2.lock().await.group_id();
+                let g1_id = harness.alice_kh.generate_group(vec![]).await.expect("g1");
+                let g2_id = harness.alice_kh.generate_group(vec![]).await.expect("g2");
                 harness
                     .alice_kh
                     .add_member(
-                        Agent::Group(g1_id, g1.clone()),
-                        &Membered::Document(doc_id, doc.clone()),
+                        Identifier::from(MemberedId::GroupId(g1_id)),
+                        MemberedId::DocumentId(doc_id),
                         Access::Read,
                         &[],
                     )
@@ -403,22 +405,24 @@ mod nested_chain_sync_repro {
                 harness
                     .alice_kh
                     .add_member(
-                        Agent::Group(g2_id, g2.clone()),
-                        &Membered::Group(g1_id, g1.clone()),
+                        Identifier::from(MemberedId::GroupId(g2_id)),
+                        MemberedId::GroupId(g1_id),
                         Access::Read,
                         &[],
                     )
                     .await
                     .expect("nest g2 into g1");
                 let bob_identifier = harness.bob_id.to_identifier().expect("bob identifier");
-                let bob_agent = harness
-                    .alice_kh
-                    .get_agent(bob_identifier)
-                    .await
-                    .expect("alice knows bob's agent");
+                // `add_member` resolves the agent id itself and fails for an unknown agent, so the
+                // `get_agent` lookup and its panic message are no longer needed here.
                 harness
                     .alice_kh
-                    .add_member(bob_agent, &Membered::Group(g2_id, g2.clone()), Access::Read, &[])
+                    .add_member(
+                        bob_identifier,
+                        MemberedId::GroupId(g2_id),
+                        Access::Read,
+                        &[],
+                    )
                     .await
                     .expect("add bob to g2");
                 doc_id

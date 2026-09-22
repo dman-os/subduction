@@ -15,8 +15,8 @@ async fn duplicate_sync_response_after_request_completion_is_ignored() {
     let (bob_proto, bob_kh, _) = make_protocol_with_shared_keyhive(make_keyhive().await).await;
     let bob_id = bob_proto.peer_id().clone();
 
-    let alice_cc = alice_kh.contact_card().await.unwrap();
-    let bob_cc = bob_kh.contact_card().await.unwrap();
+    let alice_cc = alice_kh.generate_contact_card().await.unwrap();
+    let bob_cc = bob_kh.generate_contact_card().await.unwrap();
     alice_kh.receive_contact_card(&bob_cc).await.unwrap();
     bob_kh.receive_contact_card(&alice_cc).await.unwrap();
 

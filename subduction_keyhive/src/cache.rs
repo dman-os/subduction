@@ -57,6 +57,31 @@ pub(crate) struct PeriodicEventCache {
     last_total_ops: Option<u64>,
 }
 
+/// What the cache can say about a peer pair.
+///
+/// Both arms serve the public set when the pair shares no private events, which is why they
+/// used to be returned as one indistinguishable `Arc`. Collapsing them there is a correctness
+/// bug rather than an economy: the callers that decide "is this peer unknown?" asked whether
+/// the pair lookup produced anything, so an unknown peer answered with the public set looked
+/// known, and the contact-card exchange — the only carrier of key material for a peer we have
+/// never met — became unreachable. Keep the arms distinct, and let a caller that only wants
+/// the set to serve say so with [`Self::served`].
+#[derive(Debug)]
+pub(crate) enum PeerPairProjection {
+    /// The local keyhive holds no visible-set entry for one of the peers, so it has never
+    /// seen it: there is no advertisement to offer, and nothing private can be shared until
+    /// a contact card is exchanged.
+    ///
+    /// This arm deliberately carries **no** set. An `Unknown` that could answer "here is
+    /// what to advertise" is the conflation this type exists to prevent: the public set it
+    /// would hold is indistinguishable from a known peer's, and the callers that inferred
+    /// "unknown" from emptiness made the contact-card exchange unreachable.
+    Unknown,
+    /// Both peers are in the projection; the set is public ∪ (a ∩ b). Every serving site
+    /// serves from here, because serving only ever happens for a peer we know.
+    Known { events: Arc<AgentHashMap> },
+}
+
 impl PeriodicEventCache {
     /// Create an empty cache.
     pub(crate) fn new() -> Self {
@@ -94,20 +119,26 @@ impl PeriodicEventCache {
         self.last_total_ops
     }
 
-    /// Public hashes ∪ (A ∩ B).
+    /// Public hashes ∪ (A ∩ B), tagged with whether the pair is known at all.
     ///
-    /// Every event the public agent can see is unconditionally included,
-    /// plus events reachable to both `a` and `b`. Returns an `Arc`-shared
-    /// map whose values are `Arc`-shared bytes, so callers share the cache's
-    /// single copy rather than deep-copying.
+    /// Every event the public agent can see is unconditionally included, plus events
+    /// reachable to both `a` and `b`. Both arms return an `Arc`-shared map whose values are
+    /// `Arc`-shared bytes, so callers share the cache's single copy rather than deep-copying.
+    ///
+    /// The returned [`PeerPairProjection`] keeps "this keyhive has never seen this peer"
+    /// distinct from "we know the peer and the pair shares nothing private". The known arm
+    /// serves the public set when the pair shares nothing private; the unknown arm serves
+    /// nothing at all, and collapsing the two is what made the contact-card exchange
+    /// unreachable.
     pub(crate) fn events_for_peer_pair(
         &self,
         a: &KeyhivePeerId,
         b: &KeyhivePeerId,
-    ) -> Arc<AgentHashMap> {
+    ) -> PeerPairProjection {
         let (Some(ha), Some(hb)) = (self.agent_hashes.get(a), self.agent_hashes.get(b)) else {
-            // Unknown peer: served set is the public set.
-            return self.public_map.dupe();
+            // Unknown peer: no visible set exists for it, so there is nothing to advertise
+            // and nothing can be shared until a contact card is exchanged.
+            return PeerPairProjection::Unknown;
         };
 
         // Private events reachable to both a and b, beyond the public set and
@@ -119,12 +150,16 @@ impl PeriodicEventCache {
             .peekable();
 
         if private.peek().is_none() {
-            return self.public_map.dupe();
+            return PeerPairProjection::Known {
+                events: self.public_map.dupe(),
+            };
         }
 
         let mut out = (*self.public_map).clone();
         out.extend(private);
-        Arc::new(out)
+        PeerPairProjection::Known {
+            events: Arc::new(out),
+        }
     }
 
     /// Classify a batch of changed event hashes against the connected peer
@@ -168,9 +203,8 @@ impl PeriodicEventCache {
         // converged yet). Skipping it drops the only notification that
         // recipient would ever receive, so select it conservatively and name it
         // in the diagnostic below.
-        let locally_changed = local_visible.is_some_and(|visible| {
-            visible.intersection(changed).next().is_some()
-        });
+        let locally_changed =
+            local_visible.is_some_and(|visible| visible.intersection(changed).next().is_some());
         let unattributable: Vec<&KeyhivePeerId> = if locally_changed && !public_hit {
             connected
                 .iter()
@@ -345,8 +379,7 @@ mod tests {
         let public_h: EventHash = [9; 32];
         cache.public_hashes.insert(public_h);
         let conn = connected(&[1, 2, 3]);
-        let (peers, unclassified) =
-            cache.notification_targets(&local(0), &conn, &changed(&[9]));
+        let (peers, unclassified) = cache.notification_targets(&local(0), &conn, &changed(&[9]));
         assert_eq!(peers, conn);
         assert!(unclassified.is_empty());
     }
@@ -390,8 +423,7 @@ mod tests {
         // she is not a recipient. Selecting her is the only way the
         // notification cannot be silently dropped when the projection and the
         // connected-peer identity disagree.
-        let (peers, _) =
-            cache.notification_targets(&local(0), &connected(&[1, 3]), &changed(&[1]));
+        let (peers, _) = cache.notification_targets(&local(0), &connected(&[1, 3]), &changed(&[1]));
         assert_eq!(peers, connected(&[1, 3]));
     }
 
@@ -415,7 +447,10 @@ mod tests {
         // unprojected peer is selected conservatively rather than assumed
         // uninvolved.
         assert_eq!(peers, connected(&[1]));
-        assert!(unclassified.is_empty(), "incorporated local-only event is classified");
+        assert!(
+            unclassified.is_empty(),
+            "incorporated local-only event is classified"
+        );
     }
 
     #[test]
@@ -429,11 +464,21 @@ mod tests {
         batch.insert(public_h);
         let (peers, unclassified) = cache.notification_targets(&local(0), &conn, &batch);
         assert_eq!(peers, conn);
-        assert!(unclassified.is_empty(), "known local private hash must not be marked unclassified");
+        assert!(
+            unclassified.is_empty(),
+            "known local private hash must not be marked unclassified"
+        );
     }
 
+    /// An unknown pair is reported as unknown, and has nothing to serve.
+    ///
+    /// The arm is the whole answer: a caller that cannot tell this case from "known peer
+    /// sharing nothing private" cannot decide whether to ask for a contact card. Public
+    /// events existing does not make the pair known — the projection has no entry for
+    /// either peer — and the unknown arm carries no set precisely so that it cannot be
+    /// mistaken for an advertisement.
     #[test]
-    fn events_for_peer_pair_returns_only_public_when_peers_unknown() {
+    fn events_for_peer_pair_reports_unknown_peers() {
         let mut cache = PeriodicEventCache::new();
         let h: EventHash = [9; 32];
         cache.event_data.insert(h, vec![1, 2, 3].into());
@@ -441,8 +486,10 @@ mod tests {
         cache.public_map = Arc::new(cache.build_public_map());
 
         let result = cache.events_for_peer_pair(&peer(1), &peer(2));
-        assert_eq!(result.len(), 1);
-        assert!(result.contains_key(&h));
+        assert!(
+            matches!(&result, PeerPairProjection::Unknown),
+            "neither peer is in the projection, so the pair is unknown: {result:?}"
+        );
     }
 
     #[test]
@@ -470,12 +517,15 @@ mod tests {
         bob.insert(bob_only);
         cache.agent_hashes.insert(peer(2), bob);
 
-        let result = cache.events_for_peer_pair(&peer(1), &peer(2));
-        assert!(result.contains_key(&public_h), "public hash present");
-        assert!(result.contains_key(&shared_h), "shared hash present");
-        assert!(!result.contains_key(&alice_only), "alice-only excluded");
-        assert!(!result.contains_key(&bob_only), "bob-only excluded");
-        assert_eq!(result.len(), 2);
+        let PeerPairProjection::Known { events } = cache.events_for_peer_pair(&peer(1), &peer(2))
+        else {
+            panic!("both peers are in the projection");
+        };
+        assert!(events.contains_key(&public_h), "public hash present");
+        assert!(events.contains_key(&shared_h), "shared hash present");
+        assert!(!events.contains_key(&alice_only), "alice-only excluded");
+        assert!(!events.contains_key(&bob_only), "bob-only excluded");
+        assert_eq!(events.len(), 2);
     }
 
     #[test]
@@ -496,33 +546,51 @@ mod tests {
             .agent_hashes
             .insert(peer(2), BTreeSet::from([ghost_h]));
 
-        let result = cache.events_for_peer_pair(&peer(1), &peer(2));
-        assert_eq!(result.len(), 1);
-        assert!(result.contains_key(&public_h));
-        assert!(!result.contains_key(&ghost_h), "unserialized hash excluded");
+        let PeerPairProjection::Known { events } = cache.events_for_peer_pair(&peer(1), &peer(2))
+        else {
+            panic!("both peers are in the projection");
+        };
+        assert_eq!(events.len(), 1);
+        assert!(events.contains_key(&public_h));
+        assert!(!events.contains_key(&ghost_h), "unserialized hash excluded");
     }
 
+    /// The unknown and known-public-only cases must be distinguishable.
+    ///
+    /// This test previously asserted that they returned the *same* `Arc`, which is precisely
+    /// the defect: callers decided "unknown peer" from whether the lookup produced anything,
+    /// so an unknown peer answered with the public set looked known and the contact-card
+    /// request never fired, leaving a peer's key material undelivered. The known case may
+    /// still share the public map — that is the allocation win — but the two cases must not
+    /// share the answer to "do we know this peer?".
     #[test]
-    fn events_for_peer_pair_shares_public_arc_when_no_private_events() {
+    fn events_for_peer_pair_distinguishes_unknown_from_known_public_only() {
         let mut cache = PeriodicEventCache::new();
         let public_h: EventHash = [9; 32];
         cache.event_data.insert(public_h, vec![1].into());
         cache.public_hashes.insert(public_h);
         cache.public_map = Arc::new(cache.build_public_map());
 
-        // Unknown peers -> public-only -> shares the cached Arc (no allocation).
-        let r1 = cache.events_for_peer_pair(&peer(1), &peer(2));
-        assert!(Arc::ptr_eq(&r1, &cache.public_map));
+        // Unknown peers: no set, and the arm says so.
+        let unknown = cache.events_for_peer_pair(&peer(1), &peer(2));
+        assert!(
+            matches!(&unknown, PeerPairProjection::Unknown),
+            "a pair absent from the projection is unknown: {unknown:?}"
+        );
 
-        // Known peers whose intersection is only the public hash -> still shared.
+        // Known peers whose intersection is only the public hash: the public set, and a
+        // different answer to whether we know them.
         cache
             .agent_hashes
             .insert(peer(1), BTreeSet::from([public_h]));
         cache
             .agent_hashes
             .insert(peer(2), BTreeSet::from([public_h]));
-        let r2 = cache.events_for_peer_pair(&peer(1), &peer(2));
-        assert!(Arc::ptr_eq(&r2, &cache.public_map));
+        let known = cache.events_for_peer_pair(&peer(1), &peer(2));
+        let PeerPairProjection::Known { events } = known else {
+            panic!("both peers are in the projection, so the pair is known");
+        };
+        assert!(Arc::ptr_eq(&events, &cache.public_map));
     }
 
     #[test]
@@ -544,12 +612,15 @@ mod tests {
             .agent_hashes
             .insert(peer(2), BTreeSet::from([public_h, private_h]));
 
-        let result = cache.events_for_peer_pair(&peer(1), &peer(2));
+        let PeerPairProjection::Known { events } = cache.events_for_peer_pair(&peer(1), &peer(2))
+        else {
+            panic!("both peers are in the projection");
+        };
         // A fresh map, not an alias of the shared public set.
-        assert!(!Arc::ptr_eq(&result, &cache.public_map));
-        assert_eq!(result.len(), 2);
-        assert!(result.contains_key(&public_h));
-        assert!(result.contains_key(&private_h));
+        assert!(!Arc::ptr_eq(&events, &cache.public_map));
+        assert_eq!(events.len(), 2);
+        assert!(events.contains_key(&public_h));
+        assert!(events.contains_key(&private_h));
         // The shared public map is left untouched (still public-only).
         assert_eq!(cache.public_map.len(), 1);
     }

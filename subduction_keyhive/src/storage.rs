@@ -140,14 +140,7 @@ pub trait KeyhiveStorage<Async: FutureForm> {
         &self,
     ) -> Async::Future<
         '_,
-        Result<
-            Vec<(
-                StorageHash,
-                Vec<u8>,
-                Option<crate::peer_id::KeyhivePeerId>,
-            )>,
-            Self::Error,
-        >,
+        Result<Vec<(StorageHash, Vec<u8>, Option<crate::peer_id::KeyhivePeerId>)>, Self::Error>,
     >;
 
     /// Delete an event from storage.

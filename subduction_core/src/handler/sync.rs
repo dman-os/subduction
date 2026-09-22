@@ -619,6 +619,7 @@ impl<
             Err(e) => {
                 tracing::warn!(
                     peer = %from,
+                    commit_id = ?verified.payload().head(),
                     author = ?author,
                     tree = ?id,
                     error = %e,
@@ -786,6 +787,7 @@ impl<
             Err(e) => {
                 tracing::warn!(
                     peer = %from,
+                    fragment_id = ?verified.payload().head(),
                     author = ?author,
                     tree = ?id,
                     error = %e,

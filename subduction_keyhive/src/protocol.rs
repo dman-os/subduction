@@ -3903,10 +3903,9 @@ mod tests {
         // only the former to a fresh keyhive leaves it pending.
         //
         // Storage holds `other`'s full archive. A pending event should
-        // trigger a reload from storage only when recovery is enabled, so
-        // the destination keyhive's op count grows only in that case. This
-        // pins both the `with_storage_recovery` wiring and the pending
-        // guard in `ingest_events`.
+        // trigger a reload from storage only when recovery is enabled. Check
+        // the recovered grant itself, and that dependency replay reports the
+        // formerly pending delegation through the incorporation hook.
         let other = make_keyhive().await;
         let member = make_keyhive().await;
         let member_id = keyhive_peer_id(&member);
@@ -3966,6 +3965,13 @@ mod tests {
             !dependent.is_empty(),
             "add_member should introduce a dependent delegation"
         );
+        let dependent_hashes: BTreeSet<EventHash> = dependent
+            .iter()
+            .map(|bytes| {
+                let event: StaticEvent<[u8; 32]> = bincode_deserialize(bytes).unwrap();
+                *Digest::hash(&event).raw.as_bytes()
+            })
+            .collect();
 
         // Persist the dependent first, then replay its dependencies. The
         // dependent's pending-to-active transition must cross the same hook.
@@ -3983,14 +3989,24 @@ mod tests {
             .await
             .unwrap();
         assert!(sink_resolution.admitted.lock().await.is_empty());
-        let dependencies: Vec<Arc<[u8]>> = before_add_events.into_values().collect();
+        // Replay the complete prerequisite set, including the newly named member
+        // and any prekey material emitted alongside the delegation.
+        let dependencies: Vec<Arc<[u8]>> = other_proto
+            .get_events_for_agent(&other_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .into_iter()
+            .filter(|(hash, _)| !dependent_hashes.contains(hash))
+            .map(|(_, bytes)| bytes)
+            .collect();
         proto_resolution
             .ingest_events(&dependencies, None)
             .await
             .unwrap();
         assert!(
-            !sink_resolution.admitted.lock().await.is_empty(),
-            "pending-to-active replay must cross the incorporation hook"
+            dependent_hashes.is_subset(&*sink_resolution.admitted.lock().await),
+            "the formerly pending delegation must cross the incorporation hook"
         );
 
         // Store `other`'s full archive so recovery has deps to reload.
@@ -4018,8 +4034,7 @@ mod tests {
             "with recovery off, a pending event must not change the op count"
         );
 
-        // Recovery enabled: the pending event triggers a reload of the
-        // archive, raising the op count.
+        // Recovery enabled: reloading the archive restores the member grant.
         let dst_on = make_keyhive().await;
         let proto_on = TestProtocol::new(
             Arc::new(dst_on.clone()),
@@ -4028,11 +4043,14 @@ mod tests {
             dst_on.generate_contact_card().await.unwrap(),
         )
         .with_storage_recovery();
-        let before_on = proto_on.total_ops().await;
         proto_on.ingest_events(&dependent, None).await.unwrap();
-        assert!(
-            proto_on.total_ops().await > before_on,
-            "with recovery on, a pending event must reload the archive and raise the op count"
+        let recovered_members = dst_on.reachable_members(group_id).await;
+        assert_eq!(
+            recovered_members
+                .get(&member_id.to_identifier().unwrap())
+                .copied(),
+            Some(Access::Read),
+            "archive recovery must restore the dependent member grant"
         );
     }
 

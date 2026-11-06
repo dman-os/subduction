@@ -243,6 +243,10 @@ where
     cache: Mutex<PeriodicEventCache>,
     /// Serializes on-demand cache rebuilds; concurrent callers join the same rebuild.
     cache_refresh_lock: Mutex<()>,
+    /// Serializes `ingest_events` end to end. Keyhive serializes the ingest itself, but the
+    /// held-event filter in front of it must observe the previous ingest's result, so the
+    /// filter and the ingest share one critical section.
+    ingest_lock: Mutex<()>,
     /// Keyhive projection generation captured at the last successful cache
     /// refresh. The cache is stale whenever the hive's own generation has
     /// moved past this value — no external change signal required.
@@ -252,6 +256,10 @@ where
     snapshot_nested_generation: AtomicU64,
     next_request_nonce: AtomicU64,
     outbound_requests: Mutex<Map<RequestId, OutboundRequest>>,
+    /// Hashes handed to keyhive ingest, in order. Tests assert that a session never re-ingests
+    /// an event the node already holds.
+    #[cfg(test)]
+    ingested_hashes: std::sync::Mutex<Vec<EventHash>>,
     _marker: core::marker::PhantomData<Async>,
 }
 
@@ -315,10 +323,13 @@ where
             syncpoints: Mutex::new(SyncpointMap::new()),
             cache: Mutex::new(PeriodicEventCache::new()),
             cache_refresh_lock: Mutex::new(()),
+            ingest_lock: Mutex::new(()),
             snapshot_state_generation: AtomicU64::new(0),
             snapshot_nested_generation: AtomicU64::new(0),
             next_request_nonce: AtomicU64::new(0),
             outbound_requests: Mutex::new(Map::new()),
+            #[cfg(test)]
+            ingested_hashes: std::sync::Mutex::new(Vec::new()),
             _marker: core::marker::PhantomData,
         }
     }
@@ -1717,6 +1728,10 @@ where
                 }
             }
         }
+        // Concurrent handlers for one peer (a `SyncResponse` and a `SyncOps` landing together)
+        // would otherwise both pass the held-event filter below before either ingest finishes,
+        // and then re-ingest the same batch one after the other under keyhive's own lock.
+        let _ingest_guard = self.ingest_lock.lock().await;
         // Capture the projection's pending set before this exchange so the
         // reporter can attribute resolutions to the exchange that resolved
         // them — including boot-time pending events that this exchange's
@@ -1726,12 +1741,44 @@ where
             None => self.pending_event_hashes().await,
         };
 
+        // Drop events keyhive has already *incorporated* before calling keyhive ingest, which
+        // costs milliseconds per event whether or not it changes anything. Two sessions with one
+        // peer can be in flight at once (both nodes initiate on connect). Each side composes its
+        // `requested` set when it handles the other's `SyncRequest`, which can precede ingesting
+        // the events the other session's `SyncResponse` carries, so the same events arrive a
+        // second time (as `SyncOps` or another `SyncResponse`). The protocol cannot avoid asking
+        // for them: the first delivery has not landed yet when the request is composed.
+        // `contains_incorporated_event` is an exact candidate lookup in the owning store.
+        //
+        // Pending events are deliberately NOT filtered, and a batch emptied by this filter still
+        // calls keyhive ingest while anything is pending. Keyhive's ingest replays every pending
+        // event alongside the batch, so any delivery is a chance to resolve a pending event
+        // whose dependency arrived by another route; skipping the call would strand it. The call
+        // is skipped only when there is nothing to ingest and nothing to replay.
+        let mut fresh: Vec<StaticEvent<CRef>> = Vec::with_capacity(events.len());
+        for event in events {
+            if !self.keyhive.contains_incorporated_event(&event).await {
+                fresh.push(event);
+            }
+        }
+        #[cfg(test)]
+        self.ingested_hashes
+            .lock()
+            .unwrap()
+            .extend(fresh.iter().map(|event| *Digest::hash(event).raw.as_bytes()));
+        let events = fresh;
+
         let instr_in = events.len(); // INSTR
         let instr_start = std::time::Instant::now(); // INSTR
-        let (pending, mut resolved_pending) = self
-            .keyhive
-            .ingest_unsorted_static_events_with_pending_progress(events)
-            .await;
+        let (pending, mut resolved_pending) = if events.is_empty()
+            && self.keyhive.pending_event_hashes().await.is_empty()
+        {
+            (Vec::new(), false)
+        } else {
+            self.keyhive
+                .ingest_unsorted_static_events_with_pending_progress(events)
+                .await
+        };
         let instr_ingest = instr_start.elapsed(); // INSTR
         tracing::warn!(events_in = instr_in, pending_after = pending.len(), ingest = ?instr_ingest, per_event_us = instr_ingest.as_micros() as u64 / (instr_in.max(1) as u64), "INSTR keyhive ingest batch timing"); // INSTR
 
@@ -6228,6 +6275,74 @@ mod protocol_behavioural {
         core::iter::from_fn(|| conn.inbound_rx.try_recv().ok())
             .map(|msg| deserialize_message(&msg, expected_sender))
             .collect()
+    }
+
+    /// Two peers that connect initiate a keyhive sync at the same time, so each composes its
+    /// `requested` set before the other session's `SyncResponse` has landed and the same events
+    /// cross the wire twice. The receiver must not hand the second copy to keyhive ingest: it
+    /// costs milliseconds per event for no state change.
+    #[tokio::test(flavor = "current_thread")]
+    async fn concurrent_connect_never_ingests_an_event_twice() {
+        let TwoPeerHarness {
+            alice_proto,
+            bob_proto,
+            alice_kh,
+            alice_id,
+            bob_id,
+            alice_conn,
+            bob_conn,
+            ..
+        } = exchange_contact_cards_and_setup().await;
+
+        // Alice owns a large history that Bob is a member of; Bob has nothing to offer back
+        // beyond his baseline prekeys.
+        for _ in 0..8 {
+            create_group_with_read_members(&alice_kh, &[&bob_id]).await;
+        }
+
+        // Both sides initiate before either request is delivered, as when both nodes connect.
+        alice_proto
+            .sync_keyhive(Some(&bob_id))
+            .await
+            .expect("alice initiates");
+        bob_proto
+            .sync_keyhive(Some(&alice_id))
+            .await
+            .expect("bob initiates");
+
+        // Deliver FIFO per side until the exchange goes quiet.
+        loop {
+            let mut handled = false;
+            if let Ok(signed) = bob_conn.inbound_rx.try_recv() {
+                bob_proto
+                    .handle_message(&alice_id, signed, None)
+                    .await
+                    .expect("bob handles");
+                handled = true;
+            }
+            if let Ok(signed) = alice_conn.inbound_rx.try_recv() {
+                alice_proto
+                    .handle_message(&bob_id, signed, None)
+                    .await
+                    .expect("alice handles");
+                handled = true;
+            }
+            if !handled {
+                break;
+            }
+        }
+
+        for (name, proto) in [("alice", &alice_proto), ("bob", &bob_proto)] {
+            let ingested = proto.ingested_hashes.lock().unwrap().clone();
+            let distinct: BTreeSet<EventHash> = ingested.iter().copied().collect();
+            assert_eq!(
+                ingested.len(),
+                distinct.len(),
+                "{name} handed {} events to keyhive ingest but only {} were distinct",
+                ingested.len(),
+                distinct.len()
+            );
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

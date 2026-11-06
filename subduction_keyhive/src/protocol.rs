@@ -885,6 +885,7 @@ where
         message: Message,
         cached_sender_pair: Option<&AgentHashMap>,
     ) -> Result<(), ProtocolError<Conn::SendError>> {
+        let _instr_guard = InstrHandlerTimer(stringify!(handle_sync_request), std::time::Instant::now()); // INSTR
         let Message::SyncRequest {
             sender_id,
             request_id,
@@ -1034,6 +1035,7 @@ where
         message: Message,
         _cached_sender_pair: Option<&AgentHashMap>,
     ) -> Result<SyncStatus, ProtocolError<Conn::SendError>> {
+        let _instr_guard = InstrHandlerTimer(stringify!(handle_sync_response), std::time::Instant::now()); // INSTR
         let Message::SyncResponse {
             sender_id,
             request_id,
@@ -1195,6 +1197,7 @@ where
         &self,
         message: Message,
     ) -> Result<SyncStatus, ProtocolError<Conn::SendError>> {
+        let _instr_guard = InstrHandlerTimer(stringify!(handle_sync_ops), std::time::Instant::now()); // INSTR
         let Message::SyncOps {
             sender_id,
             request_id,
@@ -1723,10 +1726,14 @@ where
             None => self.pending_event_hashes().await,
         };
 
+        let instr_in = events.len(); // INSTR
+        let instr_start = std::time::Instant::now(); // INSTR
         let (pending, mut resolved_pending) = self
             .keyhive
             .ingest_unsorted_static_events_with_pending_progress(events)
             .await;
+        let instr_ingest = instr_start.elapsed(); // INSTR
+        tracing::warn!(events_in = instr_in, pending_after = pending.len(), ingest = ?instr_ingest, per_event_us = instr_ingest.as_micros() as u64 / (instr_in.max(1) as u64), "INSTR keyhive ingest batch timing"); // INSTR
 
         if !pending.is_empty() {
             if self.attempt_storage_recovery {
@@ -1759,9 +1766,11 @@ where
         // and must never observe an event before its corresponding state.
         // The exchange is not acknowledged until these writes complete, so a
         // crash between ingestion and persistence causes the sender to retry.
+        let instr_persist_start = std::time::Instant::now(); // INSTR
         let inserted = self
             .persist_incorporated_event_bytes(event_bytes_list, source, prev_pending)
             .await?;
+        tracing::warn!(events_in = instr_in, persist = ?instr_persist_start.elapsed(), total = ?instr_start.elapsed(), "INSTR keyhive persist batch timing"); // INSTR
         Ok(!inserted.is_empty() || resolved_pending)
     }
 
@@ -6863,3 +6872,9 @@ mod protocol_behavioural {
         drop(status);
     }
 }
+
+/// INSTR: logs the wall time of a sync handler when it returns.
+struct InstrHandlerTimer(&'static str, std::time::Instant); // INSTR
+impl Drop for InstrHandlerTimer { // INSTR
+    fn drop(&mut self) { tracing::warn!(handler = self.0, wall = ?self.1.elapsed(), "INSTR keyhive handler timing"); } // INSTR
+} // INSTR

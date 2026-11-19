@@ -573,6 +573,7 @@ where
         }
 
         tracing::debug!(
+            target: "instr",
             keyhive_peer = %self.peer_id,
             named_delegates = closure.named_delegates,
             uncovered_naming_events = closure.uncovered_naming_events,
@@ -1023,6 +1024,7 @@ where
         let req_prefixes: Vec<alloc::string::String> =
             requested.iter().map(|h| Self::short_hash(h)).collect();
         tracing::warn!(
+            target: "instr",
             local = %local,
             from = %sender_id,
             ?request_id,
@@ -1125,6 +1127,7 @@ where
                 .map(|h| Self::short_hash(h))
                 .collect();
             tracing::warn!(
+                target: "instr",
                 local = %self.peer_id(),
                 from = %sender_id,
                 received = ?instr_received,
@@ -1260,6 +1263,7 @@ where
                 .map(|h| Self::short_hash(h))
                 .collect();
             tracing::warn!(
+                target: "instr",
                 local = %self.peer_id(),
                 from = %sender_id,
                 incoming = ?instr_incoming,
@@ -1484,6 +1488,7 @@ where
                 }
             }
             tracing::warn!(
+                target: "instr",
                 sent_prekeys,
                 sent_delegations,
                 local_prekeys,
@@ -1559,6 +1564,7 @@ where
         }
 
         tracing::warn!(
+            target: "instr",
             named_agents = ?named,
             attached_prekey_events = attached_count,
             "INSTR selection reference closure"
@@ -1780,7 +1786,7 @@ where
                 .await
         };
         let instr_ingest = instr_start.elapsed(); // INSTR
-        tracing::warn!(events_in = instr_in, pending_after = pending.len(), ingest = ?instr_ingest, per_event_us = instr_ingest.as_micros() as u64 / (instr_in.max(1) as u64), "INSTR keyhive ingest batch timing"); // INSTR
+        tracing::warn!(target: "instr", events_in = instr_in, pending_after = pending.len(), ingest = ?instr_ingest, per_event_us = instr_ingest.as_micros() as u64 / (instr_in.max(1) as u64), "INSTR keyhive ingest batch timing"); // INSTR
 
         if !pending.is_empty() {
             if self.attempt_storage_recovery {
@@ -1817,7 +1823,7 @@ where
         let inserted = self
             .persist_incorporated_event_bytes(event_bytes_list, source, prev_pending)
             .await?;
-        tracing::warn!(events_in = instr_in, persist = ?instr_persist_start.elapsed(), total = ?instr_start.elapsed(), "INSTR keyhive persist batch timing"); // INSTR
+        tracing::warn!(target: "instr", events_in = instr_in, persist = ?instr_persist_start.elapsed(), total = ?instr_start.elapsed(), "INSTR keyhive persist batch timing"); // INSTR
         Ok(!inserted.is_empty() || resolved_pending)
     }
 
@@ -6991,5 +6997,5 @@ mod protocol_behavioural {
 /// INSTR: logs the wall time of a sync handler when it returns.
 struct InstrHandlerTimer(&'static str, std::time::Instant); // INSTR
 impl Drop for InstrHandlerTimer { // INSTR
-    fn drop(&mut self) { tracing::warn!(handler = self.0, wall = ?self.1.elapsed(), "INSTR keyhive handler timing"); } // INSTR
+    fn drop(&mut self) { tracing::warn!(target: "instr", handler = self.0, wall = ?self.1.elapsed(), "INSTR keyhive handler timing"); } // INSTR
 } // INSTR

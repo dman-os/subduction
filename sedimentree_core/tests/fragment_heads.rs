@@ -132,3 +132,26 @@ fn fragment_checkpoint_marks_a_stored_head_as_an_ancestor() {
     assert_eq!(minimal.fragments().count(), 2);
     assert_eq!(minimal.heads_assuming_minimal(), vec![covering_head]);
 }
+
+/// A fragment whose own head is also listed among its checkpoints is still the
+/// tip of the tree: a checkpoint covers another fragment's head, never the
+/// fragment's own.
+#[test]
+fn a_fragments_own_head_listed_as_its_checkpoint_stays_a_head() {
+    let head = fragment_id(1);
+    let tree = Sedimentree::new(
+        vec![
+            Fragment::new(
+                SEDIMENTREE_ID,
+                head,
+                BTreeSet::new(),
+                &[head],
+                blob_meta(),
+            )
+            .expect("valid metadata"),
+        ],
+        vec![],
+    );
+
+    assert_eq!(tree.heads(&CountLeadingZeroBytes), vec![head]);
+}

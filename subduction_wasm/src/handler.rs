@@ -19,7 +19,7 @@ use subduction_core::{
     authenticated::Authenticated,
     connection::message::SyncMessage,
     handler::{Handler, sync::SyncHandler},
-    peer::id::PeerId,
+    peer::{id::PeerId, session::Session},
     remote_heads::{RemoteHeads, RemoteHeadsNotifier},
     subduction::error::{IoError, ListenError},
     transport::message::MessageTransport,
@@ -147,15 +147,15 @@ impl Handler<Local, WasmConn> for WasmKeyhiveHandler {
         })
     }
 
-    fn on_peer_disconnect(&self, peer: PeerId) -> LocalBoxFuture<'_, ()> {
+    fn on_peer_disconnect(&self, session: Session) -> LocalBoxFuture<'_, ()> {
         Box::pin(async move {
             if let Some(builtin) = &self.builtin {
-                builtin.remove_peer(peer).await;
+                builtin.remove_peer(session).await;
                 return;
             }
             let guard = self.handler.lock().await;
             if let Some(ref handler) = *guard {
-                let peer_id = sedimentree_wasm::pojo::hex(peer.as_bytes());
+                let peer_id = sedimentree_wasm::pojo::hex(session.remote().as_bytes());
                 if let Err(e) = handler.js_on_peer_disconnect(peer_id) {
                     tracing::error!("keyhive frame handler onPeerDisconnect error: {:?}", e);
                 }
@@ -243,11 +243,11 @@ impl Handler<Local, WasmConn> for WasmComposedHandler {
         })
     }
 
-    fn on_peer_disconnect(&self, peer: PeerId) -> LocalBoxFuture<'_, ()> {
+    fn on_peer_disconnect(&self, session: Session) -> LocalBoxFuture<'_, ()> {
         Box::pin(async move {
-            Handler::<Local, WasmConn>::on_peer_disconnect(&self.sync, peer).await;
-            Handler::<Local, WasmConn>::on_peer_disconnect(&self.ephemeral, peer).await;
-            Handler::<Local, WasmConn>::on_peer_disconnect(&self.keyhive, peer).await;
+            Handler::<Local, WasmConn>::on_peer_disconnect(&self.sync, session).await;
+            Handler::<Local, WasmConn>::on_peer_disconnect(&self.ephemeral, session).await;
+            Handler::<Local, WasmConn>::on_peer_disconnect(&self.keyhive, session).await;
         })
     }
 }

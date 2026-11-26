@@ -1082,7 +1082,7 @@ impl Output for PeerSyncResults {
     fn output(self) -> JsValue {
         let fields: Vec<_> = self
             .into_iter()
-            .map(|(peer, result)| (p::hex(peer.as_bytes()), result.output()))
+            .map(|(peer, result)| (p::hex(peer.remote().as_bytes()), result.output()))
             .collect();
         p::object(
             &fields

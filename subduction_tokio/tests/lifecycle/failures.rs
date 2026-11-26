@@ -205,7 +205,7 @@ async fn rediscovery_requires_explicit_opt_in() {
     let mut states = connection.watch();
     timeout(BUDGET, async {
         loop {
-            if matches!(*states.borrow_and_update(), ConnectionStatus::Connected { peer: p, generation: 1 } if p == peer(3)) { break; }
+            if matches!(*states.borrow_and_update(), ConnectionStatus::Connected { session, generation: 1 } if session.remote() == peer(3)) { break; }
             states.changed().await.unwrap();
         }
     }).await.unwrap();

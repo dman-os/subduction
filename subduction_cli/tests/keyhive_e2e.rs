@@ -40,7 +40,7 @@ use subduction_core::{
     connection::{stats::SyncStats, test_utils::TokioSpawn},
     effects::config::Config,
     handler::sync::SyncHandler,
-    peer::id::PeerId,
+    peer::{id::PeerId, session::Session},
     policy::open::OpenPolicy,
     storage::memory::MemoryStorage,
     subduction::{Subduction, builder::SubductionBuilder},
@@ -232,7 +232,12 @@ async fn legacy_documents_need_no_membership() -> TestResult {
         )
         .await?;
     let (authorized, stats, _) = carol
-        .sync_with_peer(&server_peer, id, false, SYNC_TIMEOUT)
+        .sync_with_peer(
+            &Session::new(server_peer, carol.peer_id()),
+            id,
+            false,
+            SYNC_TIMEOUT,
+        )
         .await?;
     assert!(
         authorized && stats.commits_sent == 1,
@@ -242,7 +247,12 @@ async fn legacy_documents_need_no_membership() -> TestResult {
     let dave = &dave;
     until("dave gets carol's commit", move || async move {
         let authorized = dave
-            .sync_with_peer(&server_peer, id, false, SYNC_TIMEOUT)
+            .sync_with_peer(
+                &Session::new(server_peer, dave.peer_id()),
+                id,
+                false,
+                SYNC_TIMEOUT,
+            )
             .await
             .is_ok_and(|(authorized, _, _)| authorized);
         authorized && dave.get_commits(id).await.is_some_and(|c| c.len() == 1)
@@ -419,7 +429,12 @@ async fn sync_tree(
 ) -> TestResult<(bool, SyncStats)> {
     let (authorized, stats, _errors) = node
         .subduction
-        .sync_with_peer(&server, id, false, SYNC_TIMEOUT)
+        .sync_with_peer(
+            &Session::new(server, node.subduction.peer_id()),
+            id,
+            false,
+            SYNC_TIMEOUT,
+        )
         .await?;
     Ok((authorized, stats))
 }

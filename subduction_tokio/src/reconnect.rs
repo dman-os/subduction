@@ -4,7 +4,7 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
-use subduction_core::peer::id::PeerId;
+use subduction_core::peer::{id::PeerId, session::Session};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
@@ -56,8 +56,9 @@ pub enum ConnectionStatus {
     },
     /// Authenticated and registered, not necessarily caught up.
     Connected {
-        /// Verified peer identity.
-        peer: PeerId,
+        /// The authenticated session: the verified remote peer and the local
+        /// principal that signed the handshake.
+        session: Session,
         /// Attempt generation.
         generation: u64,
     },
@@ -87,6 +88,7 @@ pub(crate) struct Logical {
     pub(crate) id: u64,
     pub(crate) cancel: CancellationToken,
     pub(crate) peer: Mutex<Option<PeerId>>,
+    pub(crate) session: Mutex<Option<Session>>,
     pub(crate) status: watch::Sender<ConnectionStatus>,
 }
 impl std::fmt::Debug for Logical {
@@ -107,6 +109,15 @@ impl ConnectionHandle {
     #[must_use]
     pub fn id(&self) -> u64 {
         self.0.id
+    }
+    /// Last authenticated session, including while waiting to reconnect.
+    /// `None` until the first attempt authenticates.
+    pub fn session(&self) -> Option<Session> {
+        *self
+            .0
+            .session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
     /// Last bound peer, including while waiting to reconnect.
     pub fn peer_id(&self) -> Option<PeerId> {

@@ -13,7 +13,11 @@ use core::fmt::Display;
 use async_lock::{Mutex, OnceCell};
 use future_form::{FutureForm, Local};
 use futures::FutureExt;
-use subduction_core::{authenticated::Authenticated, handler::Handler, peer::id::PeerId};
+use subduction_core::{
+    authenticated::Authenticated,
+    handler::Handler,
+    peer::{id::PeerId, session::Session},
+};
 use subduction_keyhive::{
     KeyhiveMessage, KeyhivePeerId, KeyhiveProtocol, KeyhiveStorage, MessageOutcome, StorageHash,
     SyncMode,
@@ -93,11 +97,11 @@ impl KeyhiveStorage<Local> for ListenerPersists {
 struct OutcomeCallback(Option<js_sys::Function>);
 
 impl OutcomeObserver for OutcomeCallback {
-    fn on_outcome(&self, peer: PeerId, outcome: MessageOutcome) {
+    fn on_outcome(&self, session: Session, outcome: MessageOutcome) {
         let Some(callback) = &self.0 else {
             return;
         };
-        let peer = JsValue::from(sedimentree_wasm::pojo::hex(peer.as_bytes()));
+        let peer = JsValue::from(sedimentree_wasm::pojo::hex(session.remote().as_bytes()));
         if let Err(e) = callback.call3(
             &JsValue::NULL,
             &peer,
@@ -172,21 +176,27 @@ impl KeyhiveSync {
                 );
                 // Peers that connected earlier, when `add_peer` could not
                 // create the handler.
-                let connected: Vec<PeerId> =
+                let connected: Vec<Session> =
                     self.connections.lock().await.keys().copied().collect();
-                for peer in connected {
-                    handler.add_peer(peer).await;
+                for session in connected {
+                    handler
+                        .add_peer(session)
+                        .await
+                        .map_err(KeyhiveError::from_display)?;
                 }
                 Ok(handler)
             })
             .await
     }
 
-    /// Register a newly connected peer, creating the handler if this is the
+    /// Register a newly connected session, creating the handler if this is the
     /// first.
-    pub(crate) async fn add_peer(&self, peer: PeerId) -> Result<(), KeyhiveError> {
-        self.handler().await?.add_peer(peer).await;
-        Ok(())
+    pub(crate) async fn add_peer(&self, session: Session) -> Result<(), KeyhiveError> {
+        self.handler()
+            .await?
+            .add_peer(session)
+            .await
+            .map_err(KeyhiveError::from_display)
     }
 
     /// Handle a keyhive frame and report its outcome to the
@@ -210,7 +220,7 @@ impl KeyhiveSync {
     ) -> Result<(), KeyhiveError> {
         self.handler()
             .await?
-            .protocol()
+            .primary()
             .sync_with_peer(&KeyhivePeerId::from_bytes(*peer.as_bytes()), mode)
             .await
             .map_err(KeyhiveError::from_display)
@@ -220,16 +230,16 @@ impl KeyhiveSync {
     pub(crate) async fn refresh_cache(&self) -> Result<(), KeyhiveError> {
         self.handler()
             .await?
-            .protocol()
+            .primary()
             .refresh_cache()
             .await
             .map_err(KeyhiveError::from_display)
     }
 
-    /// Forget a disconnected peer, unless it has connected again since.
-    pub(crate) async fn remove_peer(&self, peer: PeerId) {
+    /// Forget a disconnected session, unless it has connected again since.
+    pub(crate) async fn remove_peer(&self, session: Session) {
         if let Some(handler) = self.handler.get() {
-            handler.remove_peer(peer).await;
+            handler.remove_peer(session).await;
         }
     }
 }

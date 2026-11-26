@@ -248,3 +248,102 @@ async fn child_boot_fragment_with_parent_wire_id_is_not_admitted_into_parent_sed
     listener_task.abort();
     Ok(())
 }
+
+/// The batch-response path enforces the same boundary: a sync response for
+/// `S_parent` that carries a child-bound commit and fragment next to
+/// parent-bound ones admits only the parent-bound items.
+#[tokio::test]
+async fn batch_response_items_bound_to_another_sed_are_not_admitted() -> TestResult {
+    use sedimentree_core::{fragment::Fragment, loose_commit::id::CommitId};
+    use subduction_core::{
+        connection::message::{BatchSyncResponse, RequestedData, SyncDiff, SyncResult},
+        timeout::call::CallTimeout,
+    };
+
+    let (node, listener, actor) = make_subduction();
+
+    let parent_sed = SedimentreeId::new([1u8; 32]);
+    let child_sed = SedimentreeId::new([2u8; 32]);
+    let peer_id = PeerId::new([9u8; 32]);
+
+    let (conn, handle) = ChannelMockConnection::new_with_handle(peer_id);
+    node.add_connection(conn.authenticated()).await?;
+
+    let actor_task = tokio::spawn(actor);
+    let listener_task = tokio::spawn(listener);
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let head_byte = |b: u8| {
+        let mut h = [0u8; 32];
+        h[0] = b;
+        h
+    };
+    let make_fragment = |sed: SedimentreeId, head: [u8; 32]| async move {
+        let blob = Blob::new(head.to_vec());
+        let blob_meta = BlobMeta::new(&blob);
+        let fragment = Fragment::new(sed, CommitId::new(head), BTreeSet::new(), &[], blob_meta)
+            .expect("valid metadata");
+        let verified = Signed::seal::<Sendable, _>(&test_signer(), fragment).await;
+        (verified.into_signed(), blob)
+    };
+
+    let valid_commit = make_signed_commit(parent_sed, head_byte(0xA1), BTreeSet::new()).await;
+    let foreign_commit = make_signed_commit(child_sed, head_byte(0xB1), BTreeSet::new()).await;
+    let valid_fragment = make_fragment(parent_sed, head_byte(0xA2)).await;
+    let foreign_fragment = make_fragment(child_sed, head_byte(0xB2)).await;
+
+    // Drive a real request so the response is routed to its pending caller
+    // and ingested by `recv_batch_sync_response`.
+    let syncer = Arc::clone(&node);
+    let sync = tokio::spawn(async move {
+        syncer
+            .sync_with_peer(&peer_id, parent_sed, false, CallTimeout::Uncapped)
+            .await
+    });
+    let req_id = loop {
+        if let SyncMessage::BatchSyncRequest(req) = handle.outbound_rx.recv().await? {
+            break req.req_id;
+        }
+    };
+
+    // The foreign items come first so a loop that bailed out on the first
+    // mismatch would also lose the valid ones.
+    let response: SyncMessage = BatchSyncResponse {
+        req_id,
+        id: parent_sed,
+        result: SyncResult::Ok(SyncDiff {
+            missing_commits: vec![foreign_commit, valid_commit],
+            missing_fragments: vec![foreign_fragment, valid_fragment],
+            requesting: RequestedData::default(),
+        }),
+        responder_heads: RemoteHeads::default(),
+    }
+    .into();
+    handle.inbound_tx.send(response).await?;
+    sync.await?.expect("sync_with_peer");
+
+    let commit_heads: BTreeSet<_> = node
+        .get_commits(parent_sed)
+        .await
+        .map(|cs| cs.iter().map(LooseCommit::head).collect())
+        .unwrap_or_default();
+    let fragment_heads: BTreeSet<_> = node
+        .get_fragments(parent_sed)
+        .await
+        .map(|fs| fs.iter().map(Fragment::head).collect())
+        .unwrap_or_default();
+
+    // One comparison so a failure reports the commits and fragments together.
+    assert_eq!(
+        (commit_heads, fragment_heads),
+        (
+            BTreeSet::from([CommitId::new(head_byte(0xA1))]),
+            BTreeSet::from([CommitId::new(head_byte(0xA2))]),
+        ),
+        "batch response must admit only the parent-bound commit and fragment"
+    );
+
+    actor_task.abort();
+    listener_task.abort();
+    Ok(())
+}

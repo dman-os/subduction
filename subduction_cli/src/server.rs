@@ -37,6 +37,7 @@ use subduction_core::{
     peer::{
         counter::{PeerCounter, wall_clock_seed},
         id::PeerId,
+        session::Session,
     },
     storage::metrics::{MetricsStorage, RefreshMetrics},
     subduction::{Subduction, builder::SubductionBuilder},
@@ -1019,9 +1020,13 @@ async fn iroh_accept_loop<H: CliWireHandler>(
                 tracing::info!("iroh accept loop canceled");
                 break;
             }
+            // This endpoint's TLS key is generated independently of the node's
+            // signing key, so the signer is not the endpoint's identity and
+            // cannot be declared the node principal.
             result = subduction_iroh::server::accept_one(
                 &endpoint,
                 &signer,
+                subduction_iroh::SessionPrincipal::Shared,
                 &nonce_cache,
                 server_peer_id,
                 discovery_audience,
@@ -1046,7 +1051,7 @@ async fn register_iroh_peer<H: CliWireHandler>(
     ephemeral: &CliEphemeralHandler,
     keyhive_handler: Option<&CliKeyhiveHandler>,
 ) {
-    let remote = accepted.authenticated.peer_id();
+    let session = accepted.authenticated.session();
     tokio::spawn(accepted.listener_task);
     tokio::spawn(accepted.sender_task);
 
@@ -1055,12 +1060,12 @@ async fn register_iroh_peer<H: CliWireHandler>(
         .map(|c| MessageTransport::new(UnifiedTransport::Iroh(c)));
     match subduction.add_connection(auth).await {
         Ok(_) => {
-            ephemeral.subscribe_peer(remote).await;
-            notify_peer_connect(keyhive_handler, remote).await;
+            ephemeral.subscribe_peer(session).await;
+            notify_peer_connect(keyhive_handler, session).await;
             subduction
-                .full_sync_with_peer(&remote, true, CallTimeout::Default)
+                .full_sync_with_peer(&session, true, CallTimeout::Default)
                 .await;
-            tracing::info!(peer = %remote, "iroh: added peer");
+            tracing::info!(%session, "iroh: added peer");
         }
         Err(e) => {
             tracing::error!(error = %e, "failed to add iroh connection");
@@ -1276,7 +1281,7 @@ async fn handle_contact_card(
     keyhive_handler: Option<&CliKeyhiveHandler>,
 ) {
     let card =
-        keyhive_handler.map(|keyhive| Bytes::copy_from_slice(keyhive.protocol().contact_card()));
+        keyhive_handler.map(|keyhive| Bytes::copy_from_slice(keyhive.primary().contact_card()));
     let service = hyper::service::service_fn(move |req| {
         let card = card
             .clone()
@@ -1440,12 +1445,12 @@ async fn handle_websocket<H: CliWireHandler>(
         }
     };
 
-    let peer_id = authenticated.peer_id();
+    let session = authenticated.session();
     if let Err(e) = subduction.add_connection(authenticated).await {
         tracing::error!(error = %e, "Failed to add WebSocket connection");
     } else {
-        ephemeral.subscribe_peer(peer_id).await;
-        notify_peer_connect(keyhive_handler.as_ref(), peer_id).await;
+        ephemeral.subscribe_peer(session).await;
+        notify_peer_connect(keyhive_handler.as_ref(), session).await;
     }
 }
 
@@ -1506,14 +1511,14 @@ async fn handle_http_longpoll<H: CliWireHandler>(
                 && let Some(sid) = subduction_http_longpoll::session::SessionId::from_hex(sid_str)
                 && let Some(auth) = handler.take_authenticated(&sid).await
             {
-                let peer_id = auth.peer_id();
+                let session = auth.session();
                 let unified_auth =
                     auth.map(|lp| MessageTransport::new(UnifiedTransport::HttpLongPoll(lp)));
                 if let Err(e) = subduction.add_connection(unified_auth).await {
                     tracing::error!(error = %e, "Failed to add HTTP long-poll connection");
                 } else {
-                    ephemeral.subscribe_peer(peer_id).await;
-                    notify_peer_connect(keyhive_handler.as_ref(), peer_id).await;
+                    ephemeral.subscribe_peer(session).await;
+                    notify_peer_connect(keyhive_handler.as_ref(), session).await;
                 }
             }
 
@@ -1552,9 +1557,12 @@ async fn handle_http_longpoll<H: CliWireHandler>(
 /// Register a newly connected peer with keyhive.
 ///
 /// No-op when keyhive is disabled (`keyhive_handler` is `None`).
-async fn notify_peer_connect(keyhive_handler: Option<&CliKeyhiveHandler>, peer: PeerId) {
+async fn notify_peer_connect(keyhive_handler: Option<&CliKeyhiveHandler>, session: Session) {
     if let Some(keyhive_handler) = keyhive_handler {
-        keyhive_handler.add_peer(peer).await;
+        keyhive_handler
+            .add_peer(session)
+            .await
+            .expect("the CLI signs every session as its own keyhive principal");
     }
 }
 
@@ -1655,15 +1663,15 @@ async fn try_connect_ws<H: CliWireHandler>(
     )
     .await?;
 
-    let remote_id = authenticated.peer_id();
-    tracing::info!(peer = %remote_id, "Handshake complete: connected to peer");
+    let session = authenticated.session();
+    tracing::info!(%session, "Handshake complete: connected to peer");
 
     subduction.add_connection(authenticated).await?;
-    ephemeral.subscribe_peer(remote_id).await;
-    notify_peer_connect(keyhive_handler, remote_id).await;
+    ephemeral.subscribe_peer(session).await;
+    notify_peer_connect(keyhive_handler, session).await;
     tracing::info!(uri = %uri_str, "Connected to peer");
 
-    Ok(remote_id)
+    Ok(session.remote())
 }
 
 /// Connect to a peer via Iroh (QUIC) transport (outbound).
@@ -1683,7 +1691,15 @@ async fn try_connect_iroh<H: CliWireHandler>(
 
     let audience = Audience::discover(service_name.as_bytes());
 
-    let connect_result = subduction_iroh::client::connect(endpoint, addr, signer, audience).await?;
+    // The endpoint's TLS key is independent of the signer; see `iroh_accept_loop`.
+    let connect_result = subduction_iroh::client::connect(
+        endpoint,
+        addr,
+        signer,
+        subduction_iroh::SessionPrincipal::Shared,
+        audience,
+    )
+    .await?;
 
     let authenticated = connect_result.authenticated;
     let listener_task = connect_result.listener_task;
@@ -1718,17 +1734,17 @@ async fn try_connect_iroh<H: CliWireHandler>(
         }
     });
 
-    let remote_id = authenticated.peer_id();
+    let session = authenticated.session();
     let auth = authenticated.map(|c| MessageTransport::new(UnifiedTransport::Iroh(c)));
     subduction.add_connection(auth).await?;
-    ephemeral.subscribe_peer(remote_id).await;
-    notify_peer_connect(keyhive_handler, remote_id).await;
+    ephemeral.subscribe_peer(session).await;
+    notify_peer_connect(keyhive_handler, session).await;
     subduction
-        .full_sync_with_peer(&remote_id, true, CallTimeout::Default)
+        .full_sync_with_peer(&session, true, CallTimeout::Default)
         .await;
 
-    tracing::info!(node_id = %node_id, peer = %remote_id, "iroh: added peer");
-    Ok(remote_id)
+    tracing::info!(node_id = %node_id, %session, "iroh: added peer");
+    Ok(session.remote())
 }
 
 #[cfg(test)]

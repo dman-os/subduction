@@ -11,7 +11,7 @@
 //! * [`add_built_batch`](Subduction::add_built_batch) is the convenience
 //!   combinator that *does* await the broadcast. Against a wedged peer it must
 //!   bound at the per-call timeout (not hang forever) and surface that peer in
-//!   the returned [`PerPeerSync`] as `succeeded = false` — proving the durable
+//!   the returned [`PerSessionSync`] as `succeeded = false` — proving the durable
 //!   write still landed and the propagation outcome is observable.
 //!
 //! The wedged peer is simulated with [`PausableChannelTransport::pause`]: it
@@ -21,6 +21,7 @@
 #![allow(clippy::expect_used, clippy::indexing_slicing)]
 
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
+use subduction_core::peer::session::{Session, TEST_LOCAL};
 
 use future_form::Sendable;
 use sedimentree_core::{
@@ -175,7 +176,7 @@ async fn store_built_batch_does_not_stall_on_wedged_peer() -> TestResult {
 
 /// `add_built_batch` is the store-then-broadcast combinator. Against a wedged
 /// peer it must bound at the per-call timeout (not hang forever), persist the
-/// data, and report the wedged peer in the returned `PerPeerSync` as failed.
+/// data, and report the wedged peer in the returned `PerSessionSync` as failed.
 #[tokio::test(flavor = "current_thread")]
 async fn add_built_batch_bounds_at_timeout_and_reports_wedged_peer() -> TestResult {
     let a_signer = make_signer(41);
@@ -221,11 +222,11 @@ async fn add_built_batch_bounds_at_timeout_and_reports_wedged_peer() -> TestResu
     // rather than silently dropped or causing an Err.
     let b_peer = PeerId::from(b_signer.verifying_key());
     let (success, _stats, _conn_errs) = per_peer
-        .get(&b_peer)
+        .get(&Session::new(b_peer, TEST_LOCAL))
         .expect("wedged peer must be present in the per-peer result map");
     assert!(
         !success,
-        "wedged peer must be reported as failed in the returned PerPeerSync"
+        "wedged peer must be reported as failed in the returned PerSessionSync"
     );
 
     Ok(())
@@ -233,7 +234,7 @@ async fn add_built_batch_bounds_at_timeout_and_reports_wedged_peer() -> TestResu
 
 /// `add_commits_batch` is the parts-based store-then-broadcast combinator.
 /// Against a wedged peer it must bound at the per-call timeout, persist the
-/// commits, and report the peer as failed in the returned `PerPeerSync`.
+/// commits, and report the peer as failed in the returned `PerSessionSync`.
 #[tokio::test(flavor = "current_thread")]
 async fn add_commits_batch_bounds_at_timeout_and_reports_wedged_peer() -> TestResult {
     let a_signer = make_signer(42);
@@ -274,11 +275,11 @@ async fn add_commits_batch_bounds_at_timeout_and_reports_wedged_peer() -> TestRe
 
     let b_peer = PeerId::from(b_signer.verifying_key());
     let (success, _stats, _conn_errs) = per_peer
-        .get(&b_peer)
+        .get(&Session::new(b_peer, TEST_LOCAL))
         .expect("wedged peer must be present in the per-peer result map");
     assert!(
         !success,
-        "wedged peer must be reported as failed in the returned PerPeerSync"
+        "wedged peer must be reported as failed in the returned PerSessionSync"
     );
 
     Ok(())
@@ -330,11 +331,11 @@ async fn add_fragments_batch_bounds_at_timeout_and_reports_wedged_peer() -> Test
 
     let b_peer = PeerId::from(b_signer.verifying_key());
     let (success, _stats, _conn_errs) = per_peer
-        .get(&b_peer)
+        .get(&Session::new(b_peer, TEST_LOCAL))
         .expect("wedged peer must be present in the per-peer result map");
     assert!(
         !success,
-        "wedged peer must be reported as failed in the returned PerPeerSync"
+        "wedged peer must be reported as failed in the returned PerSessionSync"
     );
 
     Ok(())

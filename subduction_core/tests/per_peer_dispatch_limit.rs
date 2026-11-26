@@ -27,7 +27,7 @@ use subduction_core::{
     },
     effects::config::Config,
     handler::sync::SyncHandler,
-    peer::id::PeerId,
+    peer::{id::PeerId, session::Session},
     policy::open::OpenPolicy,
     remote_heads::{RemoteHeads, RemoteHeadsNotifier},
     storage::memory::MemoryStorage,
@@ -88,9 +88,9 @@ impl subduction_core::handler::Handler<Sendable, Conn> for GatedHandler {
 
     fn on_peer_disconnect(
         &self,
-        peer: PeerId,
+        session: Session,
     ) -> <Sendable as future_form::FutureForm>::Future<'_, ()> {
-        self.inner.on_peer_disconnect(peer)
+        self.inner.on_peer_disconnect(session)
     }
 }
 

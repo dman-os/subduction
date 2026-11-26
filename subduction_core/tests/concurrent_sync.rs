@@ -16,6 +16,7 @@ use std::{
     },
     time::Duration,
 };
+use subduction_core::peer::session::{Session, TEST_LOCAL};
 
 use futures::StreamExt;
 
@@ -395,7 +396,7 @@ async fn full_sync_with_peer_is_concurrent() -> TestResult {
 
     // Sync all documents with Bob
     let (ok, stats, _call_errs, _io_errs) = alice
-        .full_sync_with_peer(&bob_peer_id, true, sync_timeout)
+        .full_sync_with_peer(&Session::new(bob_peer_id, TEST_LOCAL), true, sync_timeout)
         .await;
 
     assert!(ok, "sync should succeed");
@@ -489,13 +490,14 @@ async fn many_independent_sync_with_peer_calls_are_concurrent() -> TestResult {
     tokio::time::sleep(Duration::from_millis(10)).await;
 
     let bob_peer_id = PeerId::from(bob_signer.verifying_key());
+    let bob_session = Session::new(bob_peer_id, TEST_LOCAL);
     let sync_timeout = CallTimeout::TimeoutMillis(2_000);
 
     // Fire N independent sync_with_peer calls concurrently — simulates
     // what JS Promise.all would do from the Wasm bindings.
     let mut sync_futures: futures::stream::FuturesUnordered<_> = sed_ids
         .iter()
-        .map(|&sed_id| alice.sync_with_peer(&bob_peer_id, sed_id, true, sync_timeout))
+        .map(|&sed_id| alice.sync_with_peer(&bob_session, sed_id, true, sync_timeout))
         .collect();
 
     let mut success_count = 0;

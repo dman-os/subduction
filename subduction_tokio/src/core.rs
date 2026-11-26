@@ -17,7 +17,7 @@ use subduction_core::{
     connection::stats::SyncStats,
     effects::config::Config,
     handler::sync::SyncHandler,
-    peer::id::PeerId,
+    peer::session::Session,
     policy::{connection::ConnectionPolicy, storage::StoragePolicy},
     storage::traits::Storage,
     stored::StoredUpdates,
@@ -59,7 +59,7 @@ pub(crate) trait Core: Send + Sync {
     fn ids(&self) -> BoxFuture<'_, Result<Vec<SedimentreeId>, Error>>;
     fn sync(
         &self,
-        peer: PeerId,
+        session: Session,
         id: SedimentreeId,
         subscribe: bool,
         timeout: CallTimeout,
@@ -126,7 +126,7 @@ where
     }
     fn sync(
         &self,
-        peer: PeerId,
+        session: Session,
         id: SedimentreeId,
         subscribe: bool,
         timeout: CallTimeout,
@@ -134,7 +134,7 @@ where
         Box::pin(async move {
             let (success, stats, errors) = self
                 .0
-                .sync_with_peer(&peer, id, subscribe, timeout)
+                .sync_with_peer(&session, id, subscribe, timeout)
                 .await
                 .map_err(|e| Error::with_source(ErrorKind::Operation, "sync", e))?;
             Ok(PeerSyncReport {

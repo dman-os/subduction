@@ -4,6 +4,7 @@
 
 use core::{convert::Infallible, fmt};
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
+use subduction_core::peer::session::{Session, TEST_LOCAL};
 
 use future_form::Sendable;
 use futures::{FutureExt, StreamExt, future::BoxFuture};
@@ -136,7 +137,12 @@ async fn explicit_sync_skips_denied_peers_for_missing_and_cached_documents() -> 
         }
         let (success, stats, errors) = tokio::time::timeout(
             WAIT,
-            node.sync_with_peer(&DENIED, ID, true, CallTimeout::Uncapped),
+            node.sync_with_peer(
+                &Session::new(DENIED, TEST_LOCAL),
+                ID,
+                true,
+                CallTimeout::Uncapped,
+            ),
         )
         .await??;
         assert!(!success);
@@ -147,7 +153,9 @@ async fn explicit_sync_skips_denied_peers_for_missing_and_cached_documents() -> 
             node.sync_with_all_peers(ID, true, CallTimeout::Uncapped),
         )
         .await??;
-        let (success, _, errors) = results.get(&DENIED).expect("denied peer result");
+        let (success, _, errors) = results
+            .get(&Session::new(DENIED, TEST_LOCAL))
+            .expect("denied peer result");
         assert!(!success);
         assert!(errors.is_empty());
         assert!(
@@ -157,7 +165,11 @@ async fn explicit_sync_skips_denied_peers_for_missing_and_cached_documents() -> 
     }
     let (success, _, errors, io_errors) = tokio::time::timeout(
         WAIT,
-        node.full_sync_with_peer(&DENIED, true, CallTimeout::Uncapped),
+        node.full_sync_with_peer(
+            &Session::new(DENIED, TEST_LOCAL),
+            true,
+            CallTimeout::Uncapped,
+        ),
     )
     .await?;
     assert!(!success && errors.is_empty() && io_errors.is_empty());
@@ -200,7 +212,8 @@ async fn watch_respects_policy(cached: bool) -> TestResult {
     );
     assert!(later.outbound_rx.is_empty());
 
-    node.disconnect_from_peer(&DENIED).await?;
+    node.disconnect_from_peer(&Session::new(DENIED, TEST_LOCAL))
+        .await?;
     let (conn, reconnected) = Conn::new_with_handle(DENIED);
     node.add_connection(conn.authenticated()).await?;
     assert_eq!(
@@ -245,7 +258,7 @@ async fn watch_respects_policy(cached: bool) -> TestResult {
     let (success, _, errors) = tokio::time::timeout(
         WAIT,
         node.sync_with_peer(
-            &ALLOWED,
+            &Session::new(ALLOWED, TEST_LOCAL),
             SedimentreeId::new([99; 32]),
             false,
             CallTimeout::Uncapped,

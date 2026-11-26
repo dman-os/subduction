@@ -5,7 +5,10 @@ use futures::StreamExt;
 use sedimentree_core::{blob::Blob, id::SedimentreeId, loose_commit::id::CommitId};
 use std::{collections::BTreeSet, time::Duration};
 use subduction_core::{
-    peer::id::PeerId,
+    peer::{
+        id::PeerId,
+        session::{Session, TEST_LOCAL},
+    },
     storage::memory::MemoryStorage,
     stored::{StoredEvent, StoredItem, StoredUpdates},
 };
@@ -98,17 +101,21 @@ async fn cached_and_synced_loader_discovers_new_peers_and_restores_reconnections
     contains(&a, id, 3).await;
     push(&c, &mut stream, id, 4).await;
 
-    a.disconnect_from_peer(&b.peer_id())
+    a.disconnect_from_peer(&Session::new(b.peer_id(), TEST_LOCAL))
         .await
         .expect("disconnect a");
-    b.disconnect_from_peer(&a.peer_id())
+    b.disconnect_from_peer(&Session::new(a.peer_id(), TEST_LOCAL))
         .await
         .expect("disconnect b");
     seed(&b, id, 5).await;
     connect(&a, &b).await;
     synced(&mut stream, b.peer_id()).await;
     contains(&a, id, 5).await;
-    assert!(b.get_subscribers(id).await.contains(&a.peer_id()));
+    assert!(
+        b.get_subscribers(id)
+            .await
+            .contains(&Session::new(a.peer_id(), TEST_LOCAL))
+    );
     push(&b, &mut stream, id, 6).await;
     contains(&a, id, 6).await;
     for node in [a, b, c] {
@@ -171,7 +178,11 @@ async fn peer_missing_document_can_publish_it_later_without_reconnecting() {
         StoredEvent::StorageChecked
     ));
     tokio::time::timeout(Duration::from_secs(1), async {
-        while !b.get_subscribers(id).await.contains(&a.peer_id()) {
+        while !b
+            .get_subscribers(id)
+            .await
+            .contains(&Session::new(a.peer_id(), TEST_LOCAL))
+        {
             tokio::task::yield_now().await;
         }
     })
@@ -228,7 +239,11 @@ async fn closing_loader_stops_syncing_future_connections() {
     connect(&a, &b).await;
     tokio::time::sleep(Duration::from_millis(30)).await;
     assert!(a.get_blobs(id).await.expect("storage").is_none());
-    assert!(!b.get_subscribers(id).await.contains(&a.peer_id()));
+    assert!(
+        !b.get_subscribers(id)
+            .await
+            .contains(&Session::new(a.peer_id(), TEST_LOCAL))
+    );
     a.shutdown();
     b.shutdown();
 }

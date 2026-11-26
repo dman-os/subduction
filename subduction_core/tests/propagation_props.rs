@@ -1,6 +1,6 @@
 //! Laws for subscription propagation and requester-side push.
 //!
-//! - `upstream_peers` selects exactly the non-originator peers with a dialed
+//! - `upstream_sessions` selects exactly the non-originator peers with a dialed
 //!   connection, regardless of how many other connections they have.
 //! - Requester-side ingest reports each head once: repeats within a response
 //!   and items already in the tree are not pushed.
@@ -16,6 +16,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+use subduction_core::peer::session::{Session, TEST_LOCAL};
 
 use future_form::Sendable;
 use sedimentree_core::{
@@ -35,7 +36,7 @@ use subduction_core::{
     peer::id::PeerId,
     policy::open::OpenPolicy,
     storage::memory::MemoryStorage,
-    subduction::{Subduction, builder::SubductionBuilder, upstream_peers},
+    subduction::{Subduction, builder::SubductionBuilder, upstream_sessions},
     test_utils::subscribe_request,
 };
 use subduction_crypto::{signed::Signed, signer::memory::MemorySigner};
@@ -44,16 +45,16 @@ const fn peer(seed: u8) -> PeerId {
     PeerId::new([seed; 32])
 }
 
-/// `upstream_peers(peers, originator) == { p ≠ originator : Dialed ∈ dirs(p) }`.
+/// `upstream_sessions(peers, originator) == { p ≠ originator : Dialed ∈ dirs(p) }`.
 #[test]
-fn prop_upstream_peers_is_dialed_minus_originator() {
+fn prop_upstream_sessions_is_dialed_minus_originator() {
     bolero::check!()
         .with_arbitrary::<(BTreeMap<u8, Vec<bool>>, u8)>()
         .for_each(|(table, originator)| {
             let originator = peer(*originator);
             let input = table.iter().map(|(seed, dialed)| {
                 (
-                    peer(*seed),
+                    Session::new(peer(*seed), TEST_LOCAL),
                     dialed.iter().map(|d| {
                         if *d {
                             Direction::Dialed
@@ -63,12 +64,12 @@ fn prop_upstream_peers_is_dialed_minus_originator() {
                     }),
                 )
             });
-            let got: BTreeSet<PeerId> = upstream_peers(input, originator).into_iter().collect();
+            let got: BTreeSet<Session> = upstream_sessions(input, originator).into_iter().collect();
 
-            let want: BTreeSet<PeerId> = table
+            let want: BTreeSet<Session> = table
                 .iter()
                 .filter(|(seed, dialed)| peer(**seed) != originator && dialed.contains(&true))
-                .map(|(seed, _)| peer(*seed))
+                .map(|(seed, _)| Session::new(peer(*seed), TEST_LOCAL))
                 .collect();
             assert_eq!(got, want);
         });

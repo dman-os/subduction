@@ -1,10 +1,10 @@
-//! Multiplexers indexed by peer and physical connection.
+//! Multiplexers indexed by session and physical connection.
 
 use alloc::{sync::Arc, vec::Vec};
 use future_form::FutureForm;
 use sedimentree_core::collections::Map;
 
-use crate::{authenticated::Authenticated, multiplexer::Multiplexer, peer::id::PeerId};
+use crate::{authenticated::Authenticated, multiplexer::Multiplexer, peer::session::Session};
 
 #[derive(Debug)]
 struct Entry<Conn: Clone, Async: FutureForm> {
@@ -12,16 +12,16 @@ struct Entry<Conn: Clone, Async: FutureForm> {
     mux: Arc<Multiplexer>,
 }
 
-/// One mux per registered physical connection, grouped by authenticated peer.
+/// One mux per registered physical connection, grouped by session.
 #[derive(Debug)]
 pub(super) struct MultiplexerMap<Conn: Clone, Async: FutureForm> {
-    by_peer: Map<PeerId, Vec<Entry<Conn, Async>>>,
+    by_session: Map<Session, Vec<Entry<Conn, Async>>>,
 }
 
 impl<Conn: Clone + PartialEq, Async: FutureForm> MultiplexerMap<Conn, Async> {
     pub(super) fn new() -> Self {
         Self {
-            by_peer: Map::new(),
+            by_session: Map::new(),
         }
     }
 
@@ -30,25 +30,25 @@ impl<Conn: Clone + PartialEq, Async: FutureForm> MultiplexerMap<Conn, Async> {
     ///
     /// ## Panics
     ///
-    /// - If a mux is already registered for the same physical connection to the same peer.
+    /// - If a mux is already registered for the same physical connection of the same session.
     pub(super) fn insert(&mut self, connection: Authenticated<Conn, Async>, mux: Arc<Multiplexer>) {
-        let peer_id = connection.peer_id();
+        let session = connection.session();
         assert!(
-            !self.by_peer.get(&peer_id).is_some_and(|entries| {
+            !self.by_session.get(&session).is_some_and(|entries| {
                 entries.iter().any(|entry| entry.connection == connection)
             }),
-            "duplicate muxes for the same physical connection to peer {peer_id:?}"
+            "duplicate muxes for the same physical connection of session {session:?}"
         );
-        self.by_peer
-            .entry(connection.peer_id())
+        self.by_session
+            .entry(session)
             .or_default()
             .push(Entry { connection, mux });
     }
 
     /// Clone the matching mux so it can be used after releasing the map lock.
     pub(super) fn get(&self, connection: &Authenticated<Conn, Async>) -> Option<Arc<Multiplexer>> {
-        self.by_peer
-            .get(&connection.peer_id())?
+        self.by_session
+            .get(&connection.session())?
             .iter()
             .find(|entry| &entry.connection == connection)
             .map(|entry| entry.mux.clone())
@@ -57,7 +57,7 @@ impl<Conn: Clone + PartialEq, Async: FutureForm> MultiplexerMap<Conn, Async> {
     /// Snapshot connection/mux pairs for work that outlives the map lock.
     /// Cloning the existing mux Arcs preserves physical-generation identity.
     pub(super) fn snapshot(&self) -> Vec<(Authenticated<Conn, Async>, Arc<Multiplexer>)> {
-        self.by_peer
+        self.by_session
             .values()
             .flatten()
             .map(|entry| (entry.connection.clone(), entry.mux.clone()))
@@ -69,8 +69,8 @@ impl<Conn: Clone + PartialEq, Async: FutureForm> MultiplexerMap<Conn, Async> {
         &mut self,
         connection: &Authenticated<Conn, Async>,
     ) -> Vec<Arc<Multiplexer>> {
-        let peer_id = connection.peer_id();
-        let entries = self.by_peer.remove(&peer_id).unwrap_or_default();
+        let session = connection.session();
+        let entries = self.by_session.remove(&session).unwrap_or_default();
         let mut detached = Vec::new();
         let mut retained = Vec::new();
         for entry in entries {
@@ -81,15 +81,15 @@ impl<Conn: Clone + PartialEq, Async: FutureForm> MultiplexerMap<Conn, Async> {
             }
         }
         if !retained.is_empty() {
-            self.by_peer.insert(peer_id, retained);
+            self.by_session.insert(session, retained);
         }
         detached
     }
 
-    /// Detach every mux for a peer, leaving other peers untouched.
-    pub(super) fn detach_peer(&mut self, peer_id: &PeerId) -> Vec<Arc<Multiplexer>> {
-        self.by_peer
-            .remove(peer_id)
+    /// Detach every mux of a session, leaving other sessions untouched.
+    pub(super) fn detach_session(&mut self, session: &Session) -> Vec<Arc<Multiplexer>> {
+        self.by_session
+            .remove(session)
             .unwrap_or_default()
             .into_iter()
             .map(|entry| entry.mux)
@@ -98,7 +98,7 @@ impl<Conn: Clone + PartialEq, Async: FutureForm> MultiplexerMap<Conn, Async> {
 
     /// Empty the registry and return its muxes for post-lock cancellation.
     pub(super) fn detach_all(&mut self) -> Vec<Arc<Multiplexer>> {
-        core::mem::take(&mut self.by_peer)
+        core::mem::take(&mut self.by_session)
             .into_values()
             .flatten()
             .map(|entry| entry.mux)
@@ -106,15 +106,18 @@ impl<Conn: Clone + PartialEq, Async: FutureForm> MultiplexerMap<Conn, Async> {
     }
 
     #[cfg(any(feature = "test_utils", test))]
-    pub(super) fn count(&self, peer_id: &PeerId) -> usize {
-        self.by_peer.get(peer_id).map_or(0, Vec::len)
+    pub(super) fn count(&self, session: &Session) -> usize {
+        self.by_session.get(session).map_or(0, Vec::len)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::authenticated::Direction;
+    use crate::{
+        authenticated::Direction,
+        peer::{id::PeerId, session::TEST_LOCAL},
+    };
     use core::time::Duration;
     use future_form::Sendable;
 
@@ -133,7 +136,10 @@ mod tests {
             let conn = connection(id, 10);
             map.insert(conn.clone(), mux(&conn));
         }
-        assert_eq!(map.count(&PeerId::new([10; 32])), 3);
+        assert_eq!(
+            map.count(&Session::new(PeerId::new([10; 32]), TEST_LOCAL)),
+            3
+        );
     }
 
     #[test]
@@ -195,7 +201,7 @@ mod tests {
         assert!(map.get(&b).is_some_and(|found| Arc::ptr_eq(&found, &b_mux)));
         assert!(map.get(&connection(3, 10)).is_none());
         assert!(map.get(&connection(4, 20)).is_none());
-        assert_eq!(map.count(&a.peer_id()), 2);
+        assert_eq!(map.count(&a.session()), 2);
     }
 
     #[test]
@@ -222,14 +228,14 @@ mod tests {
         );
         assert!(map.detach_connection(&a).is_empty());
         assert!(map.detach_connection(&connection(4, 10)).is_empty());
-        assert_eq!(map.count(&b.peer_id()), 1);
+        assert_eq!(map.count(&b.session()), 1);
 
         assert_eq!(map.detach_connection(&b).len(), 1);
         assert!(
-            !map.by_peer.contains_key(&b.peer_id()),
-            "remove empty peer buckets"
+            !map.by_session.contains_key(&b.session()),
+            "remove empty session buckets"
         );
-        assert_eq!(map.count(&other.peer_id()), 1);
+        assert_eq!(map.count(&other.session()), 1);
     }
 
     #[test]
@@ -238,7 +244,7 @@ mod tests {
         let old = connection(1, 10);
         let replacement = connection(2, 10);
         map.insert(old.clone(), mux(&old));
-        assert_eq!(map.detach_peer(&old.peer_id()).len(), 1);
+        assert_eq!(map.detach_session(&old.session()).len(), 1);
         let replacement_mux = mux(&replacement);
         map.insert(replacement.clone(), replacement_mux.clone());
 
@@ -251,7 +257,7 @@ mod tests {
     }
 
     #[test]
-    fn peer_detachment_and_global_drain_have_distinct_scopes() {
+    fn session_detachment_and_global_drain_have_distinct_scopes() {
         let mut map = MultiplexerMap::new();
         let a = connection(1, 10);
         let b = connection(2, 10);
@@ -263,19 +269,22 @@ mod tests {
         map.insert(b, b_mux.clone());
         map.insert(other.clone(), other_mux.clone());
 
-        assert!(map.detach_peer(&PeerId::new([30; 32])).is_empty());
-        let detached = map.detach_peer(&a.peer_id());
+        assert!(
+            map.detach_session(&Session::new(PeerId::new([30; 32]), TEST_LOCAL))
+                .is_empty()
+        );
+        let detached = map.detach_session(&a.session());
         assert_eq!(detached.len(), 2);
         assert!(detached.iter().any(|found| Arc::ptr_eq(found, &a_mux)));
         assert!(detached.iter().any(|found| Arc::ptr_eq(found, &b_mux)));
-        assert_eq!(map.count(&a.peer_id()), 0);
-        assert_eq!(map.count(&other.peer_id()), 1);
-        assert!(map.detach_peer(&a.peer_id()).is_empty());
+        assert_eq!(map.count(&a.session()), 0);
+        assert_eq!(map.count(&other.session()), 1);
+        assert!(map.detach_session(&a.session()).is_empty());
 
         let rest = map.detach_all();
         assert_eq!(rest.len(), 1);
         assert!(rest.iter().any(|found| Arc::ptr_eq(found, &other_mux)));
-        assert!(map.by_peer.is_empty());
+        assert!(map.by_session.is_empty());
         assert!(map.detach_all().is_empty());
     }
 }

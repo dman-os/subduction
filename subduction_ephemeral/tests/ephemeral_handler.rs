@@ -6,6 +6,7 @@
 #![allow(clippy::panic)]
 
 use std::{sync::Arc, time::Duration};
+use subduction_core::peer::session::{Session, TEST_LOCAL};
 
 use async_lock::Mutex;
 use future_form::Sendable;
@@ -38,7 +39,7 @@ type EphConn = ChannelMockConnection<EphemeralMessage>;
 type EphAuth = Authenticated<EphConn, Sendable>;
 type EphHandle =
     subduction_core::connection::test_utils::ChannelMockConnectionHandle<EphemeralMessage>;
-type Connections = Arc<Mutex<Map<PeerId, NonEmpty<EphAuth>>>>;
+type Connections = Arc<Mutex<Map<Session, NonEmpty<EphAuth>>>>;
 
 const fn peer(n: u8) -> PeerId {
     PeerId::new([n; 32])
@@ -84,7 +85,7 @@ async fn register_peer(connections: &Connections, peer_id: PeerId) -> (EphAuth, 
     connections
         .lock()
         .await
-        .insert(peer_id, NonEmpty::new(auth.clone()));
+        .insert(auth.session(), NonEmpty::new(auth.clone()));
     (auth, handle)
 }
 
@@ -389,7 +390,8 @@ async fn disconnect_cleans_all_subscriptions() -> TestResult {
         )
         .await?;
 
-    Handler::<Sendable, EphConn>::on_peer_disconnect(&*handler, peer(1)).await;
+    Handler::<Sendable, EphConn>::on_peer_disconnect(&*handler, Session::new(peer(1), TEST_LOCAL))
+        .await;
 
     let signer = make_signer();
     for t in [Topic::new([1; 32]), Topic::new([2; 32])] {
@@ -1227,7 +1229,9 @@ async fn disconnect_clears_nonce_cache() -> TestResult {
     assert_eq!(event.payload, vec![1]);
 
     // Disconnect.
-    handler.on_peer_disconnect(sender_id).await;
+    handler
+        .on_peer_disconnect(Session::new(sender_id, TEST_LOCAL))
+        .await;
 
     // Reconnect and resend the same nonce.
     let (auth_a2, _handle_a2) = register_peer(&connections, sender_id).await;
@@ -1261,10 +1265,14 @@ async fn disconnect_unsubscribed_peer_is_noop() -> TestResult {
     let (_auth, _handle) = register_peer(&connections, peer(1)).await;
 
     // Disconnect without ever subscribing — should not panic.
-    handler.on_peer_disconnect(peer(1)).await;
+    handler
+        .on_peer_disconnect(Session::new(peer(1), TEST_LOCAL))
+        .await;
 
     // Disconnect a peer that was never even registered.
-    handler.on_peer_disconnect(peer(99)).await;
+    handler
+        .on_peer_disconnect(Session::new(peer(99), TEST_LOCAL))
+        .await;
 
     Ok(())
 }
@@ -1292,7 +1300,9 @@ async fn disconnect_does_not_affect_other_peers() -> TestResult {
     }
 
     // Disconnect A.
-    handler.on_peer_disconnect(peer(1)).await;
+    handler
+        .on_peer_disconnect(Session::new(peer(1), TEST_LOCAL))
+        .await;
 
     // Publish — B should still receive.
     let signer = make_signer();
@@ -1453,7 +1463,9 @@ async fn subscribe_after_reconnect() -> TestResult {
         .await?;
 
     // Disconnect.
-    handler.on_peer_disconnect(peer(1)).await;
+    handler
+        .on_peer_disconnect(Session::new(peer(1), TEST_LOCAL))
+        .await;
 
     // Reconnect and re-subscribe.
     let (auth_a2, handle_a2) = register_peer(&connections, peer(1)).await;
@@ -1544,7 +1556,7 @@ async fn fan_out_to_multiple_connections_per_peer() -> TestResult {
     {
         let mut locked = connections.lock().await;
         locked.insert(
-            target_peer,
+            first_auth.session(),
             NonEmpty::from((first_auth.clone(), vec![second_auth])),
         );
     }
@@ -1864,7 +1876,9 @@ async fn subscribe_peer_sends_outgoing_subscriptions() -> TestResult {
 
     // Now a new peer connects.
     let (_auth_a, handle_a) = register_peer(&connections, peer(1)).await;
-    handler.subscribe_peer(peer(1)).await;
+    handler
+        .subscribe_peer(Session::new(peer(1), TEST_LOCAL))
+        .await;
 
     let msg =
         tokio::time::timeout(Duration::from_millis(100), handle_a.outbound_rx.recv()).await??;
@@ -1885,7 +1899,9 @@ async fn subscribe_peer_no_outgoing_is_noop() -> TestResult {
     let (_auth_a, handle_a) = register_peer(&connections, peer(1)).await;
 
     // No outgoing subscriptions — should not send anything.
-    handler.subscribe_peer(peer(1)).await;
+    handler
+        .subscribe_peer(Session::new(peer(1), TEST_LOCAL))
+        .await;
 
     let result = tokio::time::timeout(Duration::from_millis(50), handle_a.outbound_rx.recv()).await;
     assert!(

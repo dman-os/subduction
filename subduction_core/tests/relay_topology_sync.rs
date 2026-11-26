@@ -6,6 +6,7 @@
 #![allow(clippy::expect_used, clippy::indexing_slicing)]
 
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
+use subduction_core::peer::session::{Session, TEST_LOCAL};
 
 use core::convert::Infallible;
 use future_form::Sendable;
@@ -190,8 +191,13 @@ async fn relay_topology_converges_on_initial_sync() -> TestResult {
     // A subscribes via R (the automerge-repo write path: store, then
     // `sync_with_all_peers(subscribe = true)`). The 1.5-RTT exchange
     // carries the commit to R.
-    a.sync_with_peer(&r_peer, sed_id, true, SYNC_TIMEOUT)
-        .await?;
+    a.sync_with_peer(
+        &Session::new(r_peer, TEST_LOCAL),
+        sed_id,
+        true,
+        SYNC_TIMEOUT,
+    )
+    .await?;
     assert!(
         wait_until(|| {
             let r = Arc::clone(&r);
@@ -204,8 +210,13 @@ async fn relay_topology_converges_on_initial_sync() -> TestResult {
     // B has no sedimentree yet, so `full_sync_with_all_peers` (which
     // iterates B's known sedimentrees) is a no-op for this id. Force a
     // per-id sync to subscribe B and pull the data.
-    b.sync_with_peer(&r_peer, sed_id, true, SYNC_TIMEOUT)
-        .await?;
+    b.sync_with_peer(
+        &Session::new(r_peer, TEST_LOCAL),
+        sed_id,
+        true,
+        SYNC_TIMEOUT,
+    )
+    .await?;
     assert!(
         wait_until(|| {
             let b = Arc::clone(&b);
@@ -310,20 +321,30 @@ async fn relay_topology_propagates_subscriptions_upstream() -> TestResult {
 
     // A subscribes to R for `sed_id` (R has no data yet).
     let r_peer = PeerId::from(r_signer.verifying_key());
-    a.sync_with_peer(&r_peer, sed_id, true, SYNC_TIMEOUT)
-        .await?;
+    a.sync_with_peer(
+        &Session::new(r_peer, TEST_LOCAL),
+        sed_id,
+        true,
+        SYNC_TIMEOUT,
+    )
+    .await?;
 
     // R propagates to B; poll until the subscription is recorded.
     let b_peer = PeerId::from(b_signer.verifying_key());
     let r_subscribed = wait_until(|| {
         let r = Arc::clone(&r);
-        async move { r.get_peer_subscriptions(b_peer).await.contains(&sed_id) }
+        async move {
+            r.get_peer_subscriptions(Session::new(b_peer, TEST_LOCAL))
+                .await
+                .contains(&sed_id)
+        }
     })
     .await;
     assert!(
         r_subscribed,
         "R failed to propagate A's subscription upstream to B: {:?}",
-        r.get_peer_subscriptions(b_peer).await
+        r.get_peer_subscriptions(Session::new(b_peer, TEST_LOCAL))
+            .await
     );
 
     // End-to-end: a commit pushed at B must reach A through R, even
@@ -489,10 +510,20 @@ async fn relay_topology_two_clients_add_built_batch_converge_via_relay() -> Test
     let sed_id = SedimentreeId::new([15u8; 32]);
 
     let r_peer = PeerId::from(make_signer(20).verifying_key());
-    a.sync_with_peer(&r_peer, sed_id, true, SYNC_TIMEOUT)
-        .await?;
-    b.sync_with_peer(&r_peer, sed_id, true, SYNC_TIMEOUT)
-        .await?;
+    a.sync_with_peer(
+        &Session::new(r_peer, TEST_LOCAL),
+        sed_id,
+        true,
+        SYNC_TIMEOUT,
+    )
+    .await?;
+    b.sync_with_peer(
+        &Session::new(r_peer, TEST_LOCAL),
+        sed_id,
+        true,
+        SYNC_TIMEOUT,
+    )
+    .await?;
     tokio::time::sleep(PROPAGATION_PAUSE).await;
 
     let total_pairs: u8 = 12;
@@ -849,7 +880,11 @@ async fn relay_topology_repeated_subscribe_sends_exactly_one_upstream_request() 
     // subscription is present), then confirm no second send landed.
     let stable = wait_until(|| {
         let r = Arc::clone(&r);
-        async move { r.get_peer_subscriptions(b_peer).await.contains(&sed_id) }
+        async move {
+            r.get_peer_subscriptions(Session::new(b_peer, TEST_LOCAL))
+                .await
+                .contains(&sed_id)
+        }
     })
     .await;
     assert!(stable, "R lost its recorded subscription to B");
@@ -1015,14 +1050,19 @@ async fn relay_topology_unauthorized_upstream_response_rolls_back_claim() -> Tes
     // Poll until the claim is gone (it may briefly exist before rollback).
     let rolled_back = wait_until(|| {
         let r = Arc::clone(&r);
-        async move { !r.get_peer_subscriptions(b_peer).await.contains(&sed_id) }
+        async move {
+            !r.get_peer_subscriptions(Session::new(b_peer, TEST_LOCAL))
+                .await
+                .contains(&sed_id)
+        }
     })
     .await;
     assert!(
         rolled_back,
         "claim rollback failed: R kept an outgoing subscription to B \
          even though B answered Unauthorized (R→B subscriptions: {:?})",
-        r.get_peer_subscriptions(b_peer).await
+        r.get_peer_subscriptions(Session::new(b_peer, TEST_LOCAL))
+            .await
     );
 
     Ok(())
@@ -1042,27 +1082,42 @@ async fn relay_drops_outgoing_claims_on_peer_disconnect() -> TestResult {
     let b_peer = PeerId::from(b_signer.verifying_key());
 
     // A subscribes to R; R propagates upstream to B and claims (B, id).
-    a.sync_with_peer(&r_peer, sed_id, true, SYNC_TIMEOUT)
-        .await?;
+    a.sync_with_peer(
+        &Session::new(r_peer, TEST_LOCAL),
+        sed_id,
+        true,
+        SYNC_TIMEOUT,
+    )
+    .await?;
     let established = wait_until(|| {
         let r = Arc::clone(&r);
-        async move { r.get_peer_subscriptions(b_peer).await.contains(&sed_id) }
+        async move {
+            r.get_peer_subscriptions(Session::new(b_peer, TEST_LOCAL))
+                .await
+                .contains(&sed_id)
+        }
     })
     .await;
     assert!(established, "propagation to B never established");
 
     // Drop R's last connection to B.
-    r.disconnect_from_peer(&b_peer).await?;
+    r.disconnect_from_peer(&Session::new(b_peer, TEST_LOCAL))
+        .await?;
 
     let cleared = wait_until(|| {
         let r = Arc::clone(&r);
-        async move { r.get_peer_subscriptions(b_peer).await.is_empty() }
+        async move {
+            r.get_peer_subscriptions(Session::new(b_peer, TEST_LOCAL))
+                .await
+                .is_empty()
+        }
     })
     .await;
     assert!(
         cleared,
         "teardown left stale outgoing-subscription claims toward B: {:?}",
-        r.get_peer_subscriptions(b_peer).await
+        r.get_peer_subscriptions(Session::new(b_peer, TEST_LOCAL))
+            .await
     );
 
     Ok(())
@@ -1083,32 +1138,57 @@ async fn relay_repropagates_subscription_after_peer_reconnect() -> TestResult {
     let b_peer = PeerId::from(b_signer.verifying_key());
 
     // Establish: A subscribes to R; R propagates to B.
-    a.sync_with_peer(&r_peer, sed_id, true, SYNC_TIMEOUT)
-        .await?;
+    a.sync_with_peer(
+        &Session::new(r_peer, TEST_LOCAL),
+        sed_id,
+        true,
+        SYNC_TIMEOUT,
+    )
+    .await?;
     let established = wait_until(|| {
         let r = Arc::clone(&r);
-        async move { r.get_peer_subscriptions(b_peer).await.contains(&sed_id) }
+        async move {
+            r.get_peer_subscriptions(Session::new(b_peer, TEST_LOCAL))
+                .await
+                .contains(&sed_id)
+        }
     })
     .await;
     assert!(established, "initial propagation to B never established");
 
     // Sever R↔B (both sides), then reconnect with fresh transports.
-    r.disconnect_from_peer(&b_peer).await?;
-    let _ = b.disconnect_from_peer(&r_peer).await;
+    r.disconnect_from_peer(&Session::new(b_peer, TEST_LOCAL))
+        .await?;
+    let _ = b
+        .disconnect_from_peer(&Session::new(r_peer, TEST_LOCAL))
+        .await;
     let cleared = wait_until(|| {
         let r = Arc::clone(&r);
-        async move { r.get_peer_subscriptions(b_peer).await.is_empty() }
+        async move {
+            r.get_peer_subscriptions(Session::new(b_peer, TEST_LOCAL))
+                .await
+                .is_empty()
+        }
     })
     .await;
     assert!(cleared, "claims not cleared before reconnect");
     connect_pair(&r, &r_signer, &b, &b_signer).await?;
 
     // A re-subscribes; R must re-propagate to the reconnected B.
-    a.sync_with_peer(&r_peer, sed_id, true, SYNC_TIMEOUT)
-        .await?;
+    a.sync_with_peer(
+        &Session::new(r_peer, TEST_LOCAL),
+        sed_id,
+        true,
+        SYNC_TIMEOUT,
+    )
+    .await?;
     let reestablished = wait_until(|| {
         let r = Arc::clone(&r);
-        async move { r.get_peer_subscriptions(b_peer).await.contains(&sed_id) }
+        async move {
+            r.get_peer_subscriptions(Session::new(b_peer, TEST_LOCAL))
+                .await
+                .contains(&sed_id)
+        }
     })
     .await;
     assert!(

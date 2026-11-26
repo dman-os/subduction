@@ -11,6 +11,7 @@ use std::{
     },
     vec::Vec,
 };
+use subduction_core::peer::session::{Session, TEST_LOCAL};
 
 use future_form::Sendable;
 use futures::{FutureExt, future::BoxFuture};
@@ -436,10 +437,17 @@ async fn requested_data_rejection(all_peers: bool) -> TestResult {
                 .sync_with_all_peers(id, false, CallTimeout::Default)
                 .await?
                 .into_map();
-            results.remove(&peer).ok_or("peer result missing")?
+            results
+                .remove(&Session::new(peer, TEST_LOCAL))
+                .ok_or("peer result missing")?
         } else {
-            node.sync_with_peer(&peer, id, false, CallTimeout::Default)
-                .await?
+            node.sync_with_peer(
+                &Session::new(peer, TEST_LOCAL),
+                id,
+                false,
+                CallTimeout::Default,
+            )
+            .await?
         };
         assert!(success, "intentional rejection still completes the round");
         assert!(errors.is_empty());

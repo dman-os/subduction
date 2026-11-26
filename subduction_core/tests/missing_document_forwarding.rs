@@ -2,6 +2,7 @@
 #![allow(clippy::expect_used, clippy::panic)]
 
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
+use subduction_core::peer::session::{Session, TEST_LOCAL};
 
 use future_form::Sendable;
 use sedimentree_core::{blob::BlobMeta, id::SedimentreeId, loose_commit::LooseCommit};
@@ -297,7 +298,14 @@ async fn failed_upstream_claim_is_retried() -> TestResult {
     client.inbound_tx.send(subscribe_request(peer, id)).await?;
     let _unanswered = request(&up).await;
     assert_eq!(commit_count(response(&client).await), 0);
-    assert!(wait_until(|| async { hub.outgoing_claims(&up_peer).await.is_none() }).await);
+    assert!(
+        wait_until(|| async {
+            hub.outgoing_claims(&Session::new(up_peer, TEST_LOCAL))
+                .await
+                .is_none()
+        })
+        .await
+    );
     client.inbound_tx.send(subscribe_request(peer, id)).await?;
     answer(&up, request(&up).await, None).await;
     assert_eq!(commit_count(response(&client).await), 0);
@@ -332,7 +340,12 @@ async fn directed_relay_cycle_does_not_deadlock() -> TestResult {
     let id = SedimentreeId::new([16; 32]);
     let (success, _, errors) = tokio::time::timeout(
         DEADLINE,
-        client.sync_with_peer(&ap, id, true, CallTimeout::Default),
+        client.sync_with_peer(
+            &Session::new(ap, TEST_LOCAL),
+            id,
+            true,
+            CallTimeout::Default,
+        ),
     )
     .await??;
     assert!(
@@ -343,9 +356,15 @@ async fn directed_relay_cycle_does_not_deadlock() -> TestResult {
     // must settle and establish their subscriptions, too.
     assert!(
         wait_until(|| async {
-            a.get_subscribers(id).await.contains(&bp)
-                && b.get_subscribers(id).await.contains(&dp)
-                && d.get_subscribers(id).await.contains(&ap)
+            a.get_subscribers(id)
+                .await
+                .contains(&Session::new(bp, TEST_LOCAL))
+                && b.get_subscribers(id)
+                    .await
+                    .contains(&Session::new(dp, TEST_LOCAL))
+                && d.get_subscribers(id)
+                    .await
+                    .contains(&Session::new(ap, TEST_LOCAL))
         })
         .await
     );
@@ -367,7 +386,12 @@ async fn multi_hop_response_contains_document() -> TestResult {
         .await?;
     let (success, _, _) = tokio::time::timeout(
         DEADLINE,
-        client.sync_with_peer(&ap, id, true, CallTimeout::Default),
+        client.sync_with_peer(
+            &Session::new(ap, TEST_LOCAL),
+            id,
+            true,
+            CallTimeout::Default,
+        ),
     )
     .await??;
     assert!(success);

@@ -20,7 +20,10 @@ use subduction_core::{
     connection::test_utils::{ChannelTransport, InstantTimeout, TokioSpawn},
     effects::config::Config,
     handler::sync::SyncHandler,
-    peer::id::PeerId,
+    peer::{
+        id::PeerId,
+        session::{Session, TEST_LOCAL},
+    },
     policy::open::OpenPolicy,
     subduction::{Subduction, builder::SubductionBuilder},
     timeout::call::CallTimeout,
@@ -226,10 +229,20 @@ async fn fs_relay_two_clients_add_built_batch_converge_via_relay() -> TestResult
     let sed_id = SedimentreeId::new([0xA2; 32]);
 
     let r_peer = PeerId::from(make_signer(20).verifying_key());
-    h.a.sync_with_peer(&r_peer, sed_id, true, SYNC_TIMEOUT)
-        .await?;
-    h.b.sync_with_peer(&r_peer, sed_id, true, SYNC_TIMEOUT)
-        .await?;
+    h.a.sync_with_peer(
+        &Session::new(r_peer, TEST_LOCAL),
+        sed_id,
+        true,
+        SYNC_TIMEOUT,
+    )
+    .await?;
+    h.b.sync_with_peer(
+        &Session::new(r_peer, TEST_LOCAL),
+        sed_id,
+        true,
+        SYNC_TIMEOUT,
+    )
+    .await?;
     tokio::time::sleep(PROPAGATION_PAUSE).await;
 
     let total_pairs: u8 = 12;
@@ -268,10 +281,20 @@ async fn fs_relay_two_clients_rapid_fire_converges() -> TestResult {
     let sed_id = SedimentreeId::new([0xA3; 32]);
 
     let r_peer = PeerId::from(make_signer(20).verifying_key());
-    h.a.sync_with_peer(&r_peer, sed_id, true, SYNC_TIMEOUT)
-        .await?;
-    h.b.sync_with_peer(&r_peer, sed_id, true, SYNC_TIMEOUT)
-        .await?;
+    h.a.sync_with_peer(
+        &Session::new(r_peer, TEST_LOCAL),
+        sed_id,
+        true,
+        SYNC_TIMEOUT,
+    )
+    .await?;
+    h.b.sync_with_peer(
+        &Session::new(r_peer, TEST_LOCAL),
+        sed_id,
+        true,
+        SYNC_TIMEOUT,
+    )
+    .await?;
     tokio::time::sleep(PROPAGATION_PAUSE).await;
 
     let total_u8: u8 = 16;

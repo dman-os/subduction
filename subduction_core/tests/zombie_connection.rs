@@ -9,6 +9,7 @@
 #![allow(clippy::panic)]
 
 use std::sync::Arc;
+use subduction_core::peer::session::{Session, TEST_LOCAL};
 
 use future_form::Sendable;
 use subduction_core::{
@@ -57,7 +58,9 @@ async fn failed_manager_handoff_rolls_back_registration() -> TestResult {
     // The rollback must be complete: the multiplexer created alongside the
     // connection has to go too, not just the map entry.
     assert_eq!(
-        subduction.mux_count(&peer_id).await,
+        subduction
+            .mux_count(&Session::new(peer_id, TEST_LOCAL))
+            .await,
         0,
         "rollback must detach the connection's multiplexer"
     );
@@ -97,7 +100,9 @@ async fn failed_reconnect_handoff_rolls_back_registration() -> TestResult {
         "a reconnect that never got a reader must not stay tracked"
     );
     assert_eq!(
-        subduction.mux_count(&peer_id).await,
+        subduction
+            .mux_count(&Session::new(peer_id, TEST_LOCAL))
+            .await,
         0,
         "reconnect rollback must detach the connection's multiplexer"
     );

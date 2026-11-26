@@ -10,6 +10,7 @@
 #![allow(clippy::expect_used, clippy::indexing_slicing)]
 
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
+use subduction_core::peer::session::{Session, TEST_LOCAL};
 
 use future_form::Sendable;
 use sedimentree_core::{
@@ -160,8 +161,13 @@ async fn store_built_batch_does_not_broadcast() -> TestResult {
     // Positive control: an explicit sync from B pulls the data, confirming
     // the link works and the negative assertion above wasn't vacuous.
     let a_peer = PeerId::from(a_signer.verifying_key());
-    b.sync_with_peer(&a_peer, sed_id, true, SYNC_TIMEOUT)
-        .await?;
+    b.sync_with_peer(
+        &Session::new(a_peer, TEST_LOCAL),
+        sed_id,
+        true,
+        SYNC_TIMEOUT,
+    )
+    .await?;
 
     let converged =
         wait_until(|| async { b.get_commits(sed_id).await.as_ref().map(Vec::len) == Some(5) })

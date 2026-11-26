@@ -47,7 +47,7 @@ use crate::{
         storage::HasStorage,
     },
     minimized_tree_store::MinimizedTreeStore,
-    peer::id::PeerId,
+    peer::{id::PeerId, session::Session},
     spawn::Spawn,
     storage::{
         mutation::MutationError, powerbox::StoragePowerbox, putter::Putter, state::cache::Resident,
@@ -90,8 +90,8 @@ pub struct SyncHandler<
     R: RemoteHeadsObserver = NoRemoteHeadsObserver,
 > {
     minimized_tree_store: E::MinimizedTreeStore,
-    connections: Arc<Mutex<Map<PeerId, NonEmpty<Authenticated<Conn, Async>>>>>,
-    subscriptions: Arc<Mutex<Map<SedimentreeId, Set<PeerId>>>>,
+    connections: Arc<Mutex<Map<Session, NonEmpty<Authenticated<Conn, Async>>>>>,
+    subscriptions: Arc<Mutex<Map<SedimentreeId, Set<Session>>>>,
     storage: StoragePowerbox<E::Storage, E::Policy, Async>,
     depth_metric: Metric,
     heads_notifier: FilteredHeadsNotifier<R>,
@@ -158,8 +158,8 @@ impl<
     #[allow(clippy::type_complexity)]
     pub fn new(
         minimized_tree_store: E::MinimizedTreeStore,
-        connections: Arc<Mutex<Map<PeerId, NonEmpty<Authenticated<Conn, Async>>>>>,
-        subscriptions: Arc<Mutex<Map<SedimentreeId, Set<PeerId>>>>,
+        connections: Arc<Mutex<Map<Session, NonEmpty<Authenticated<Conn, Async>>>>>,
+        subscriptions: Arc<Mutex<Map<SedimentreeId, Set<Session>>>>,
         storage: StoragePowerbox<E::Storage, E::Policy, Async>,
         depth_metric: Metric,
         spawner: E::Spawner,
@@ -191,8 +191,8 @@ impl<
     #[allow(clippy::type_complexity)]
     pub fn with_remote_heads_observer(
         minimized_tree_store: E::MinimizedTreeStore,
-        connections: Arc<Mutex<Map<PeerId, NonEmpty<Authenticated<Conn, Async>>>>>,
-        subscriptions: Arc<Mutex<Map<SedimentreeId, Set<PeerId>>>>,
+        connections: Arc<Mutex<Map<Session, NonEmpty<Authenticated<Conn, Async>>>>>,
+        subscriptions: Arc<Mutex<Map<SedimentreeId, Set<Session>>>>,
         storage: StoragePowerbox<E::Storage, E::Policy, Async>,
         depth_metric: Metric,
         remote_heads_observer: R,
@@ -241,7 +241,7 @@ impl<
     ///
     /// [`EphemeralHandler`]: subduction_ephemeral::handler::EphemeralHandler
     #[allow(clippy::type_complexity)]
-    pub fn connections(&self) -> Arc<Mutex<Map<PeerId, NonEmpty<Authenticated<Conn, Async>>>>> {
+    pub fn connections(&self) -> Arc<Mutex<Map<Session, NonEmpty<Authenticated<Conn, Async>>>>> {
         self.connections.clone()
     }
 
@@ -312,7 +312,7 @@ impl<
         })
     }
 
-    fn on_peer_disconnect(&self, _peer: PeerId) -> Async::Future<'_, ()> {
+    fn on_peer_disconnect(&self, _session: Session) -> Async::Future<'_, ()> {
         // No-op: teardown already removed the peer's connection and
         // subscriptions, and the send counter deliberately survives (see
         // `PeerCounter`).
@@ -496,7 +496,7 @@ impl<
                 crate::metrics::batch_sync_request();
 
                 if subscribe {
-                    self.add_subscription(from, id).await;
+                    self.add_subscription(conn.session(), id).await;
                     tracing::debug!(peer = %from, tree = ?id, "added subscription");
                 }
 
@@ -523,7 +523,7 @@ impl<
             SyncMessage::RemoveSubscriptions(crate::connection::message::RemoveSubscriptions {
                 ids,
             }) => {
-                self.remove_subscriptions(from, &ids).await;
+                self.remove_subscriptions(conn.session(), &ids).await;
                 tracing::debug!(peer = %from, trees = ?ids, "removed subscriptions");
                 None
             }
@@ -1216,17 +1216,17 @@ impl<
         }
     }
 
-    async fn add_subscription(&self, peer_id: PeerId, sedimentree_id: SedimentreeId) {
-        peers::add_subscription(&self.subscriptions, peer_id, sedimentree_id).await;
+    async fn add_subscription(&self, session: Session, sedimentree_id: SedimentreeId) {
+        peers::add_subscription(&self.subscriptions, session, sedimentree_id).await;
         #[cfg(feature = "metrics")]
         crate::metrics::set_subscribed_sedimentrees(self.subscriptions.lock().await.len());
     }
 
-    async fn remove_subscriptions(&self, peer_id: PeerId, ids: &[SedimentreeId]) {
+    async fn remove_subscriptions(&self, session: Session, ids: &[SedimentreeId]) {
         let mut subscriptions = self.subscriptions.lock().await;
         for id in ids {
             if let Some(peer_set) = subscriptions.get_mut(id) {
-                peer_set.remove(&peer_id);
+                peer_set.remove(&session);
                 if peer_set.is_empty() {
                     subscriptions.remove(id);
                 }

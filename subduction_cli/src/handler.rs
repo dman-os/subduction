@@ -22,7 +22,7 @@ use subduction_core::{
     connection::message::SyncMessage,
     effects::config::Config,
     handler::{Handler, sync::SyncHandler},
-    peer::id::PeerId,
+    peer::{id::PeerId, session::Session},
     remote_heads::{RemoteHeads, RemoteHeadsNotifier},
     storage::metrics::MetricsStorage,
     subduction::error::{IoError, ListenError},
@@ -130,9 +130,9 @@ impl CliHandlerOpenPolicy {
     }
 
     /// Forward a peer disconnect to the sync and ephemeral handlers.
-    async fn disconnect_core(&self, peer: PeerId) {
-        Handler::<Sendable, CliConn>::on_peer_disconnect(self.sync.as_ref(), peer).await;
-        Handler::<Sendable, CliConn>::on_peer_disconnect(&self.ephemeral, peer).await;
+    async fn disconnect_core(&self, session: Session) {
+        Handler::<Sendable, CliConn>::on_peer_disconnect(self.sync.as_ref(), session).await;
+        Handler::<Sendable, CliConn>::on_peer_disconnect(&self.ephemeral, session).await;
     }
 }
 
@@ -219,10 +219,10 @@ impl Handler<Sendable, CliConn> for CliHandler {
         })
     }
 
-    fn on_peer_disconnect(&self, peer: PeerId) -> BoxFuture<'_, ()> {
+    fn on_peer_disconnect(&self, session: Session) -> BoxFuture<'_, ()> {
         Box::pin(async move {
-            self.core.disconnect_core(peer).await;
-            Handler::<Sendable, CliConn>::on_peer_disconnect(&self.keyhive, peer).await;
+            self.core.disconnect_core(session).await;
+            Handler::<Sendable, CliConn>::on_peer_disconnect(&self.keyhive, session).await;
         })
     }
 }
@@ -249,9 +249,9 @@ impl Handler<Sendable, CliConn> for CliHandlerOpenPolicy {
         })
     }
 
-    fn on_peer_disconnect(&self, peer: PeerId) -> BoxFuture<'_, ()> {
+    fn on_peer_disconnect(&self, session: Session) -> BoxFuture<'_, ()> {
         Box::pin(async move {
-            self.disconnect_core(peer).await;
+            self.disconnect_core(session).await;
         })
     }
 }

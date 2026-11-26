@@ -10,6 +10,7 @@
 
 use core::{convert::Infallible, fmt};
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
+use subduction_core::peer::session::{Session, TEST_LOCAL};
 
 use future_form::Sendable;
 use futures::{FutureExt, future::BoxFuture};
@@ -231,8 +232,13 @@ async fn add_commit_without_subscribers_pushes_nothing() -> TestResult {
     );
 
     // Positive control.
-    b.sync_with_peer(&PeerId::from(a_s.verifying_key()), id, true, SYNC_TIMEOUT)
-        .await?;
+    b.sync_with_peer(
+        &Session::new(PeerId::from(a_s.verifying_key()), TEST_LOCAL),
+        id,
+        true,
+        SYNC_TIMEOUT,
+    )
+    .await?;
     assert!(
         wait_until(|| async { commit_count(&b, id).await == 1 }).await,
         "after subscribing, B must receive the commit"
@@ -263,8 +269,13 @@ async fn add_fragment_without_subscribers_pushes_nothing() -> TestResult {
     );
 
     // Positive control.
-    b.sync_with_peer(&PeerId::from(a_s.verifying_key()), id, true, SYNC_TIMEOUT)
-        .await?;
+    b.sync_with_peer(
+        &Session::new(PeerId::from(a_s.verifying_key()), TEST_LOCAL),
+        id,
+        true,
+        SYNC_TIMEOUT,
+    )
+    .await?;
     assert!(
         wait_until(|| async { fragment_count(&b, id).await == 1 }).await,
         "after subscribing, B must receive the fragment"
@@ -294,12 +305,15 @@ async fn add_commit_pushes_only_to_authorized_subscribers() -> TestResult {
     // Both subscribe. A records both subscriptions (that happens before the
     // fetch-policy check); C's request is answered `Unauthorized`, which
     // `sync_with_peer` reports as `Ok((false, ..))`, not an error.
-    b.sync_with_peer(&a_peer, id, true, SYNC_TIMEOUT).await?;
-    c.sync_with_peer(&a_peer, id, true, SYNC_TIMEOUT).await?;
+    b.sync_with_peer(&Session::new(a_peer, TEST_LOCAL), id, true, SYNC_TIMEOUT)
+        .await?;
+    c.sync_with_peer(&Session::new(a_peer, TEST_LOCAL), id, true, SYNC_TIMEOUT)
+        .await?;
     assert!(
         wait_until(|| async {
             let subs = a.get_subscribers(id).await;
-            subs.contains(&b_peer) && subs.contains(&c_peer)
+            subs.contains(&Session::new(b_peer, TEST_LOCAL))
+                && subs.contains(&Session::new(c_peer, TEST_LOCAL))
         })
         .await,
         "A should have recorded both subscriptions"
@@ -361,7 +375,12 @@ async fn add_commit_sends_one_frame_per_commit_to_a_subscriber() -> TestResult {
         }))
         .await?;
     assert!(
-        wait_until(|| async { a.get_subscribers(id).await.contains(&b_peer) }).await,
+        wait_until(|| async {
+            a.get_subscribers(id)
+                .await
+                .contains(&Session::new(b_peer, TEST_LOCAL))
+        })
+        .await,
         "A should have recorded B's subscription"
     );
     // Discard the BatchSyncResponse so only pushes remain on the wire.
@@ -431,8 +450,12 @@ async fn requester_pulled_data_is_pushed_only_to_authorized_subscribers() -> Tes
 
     // Both subscribe on R. R has nothing yet, propagates upstream to B, and
     // pulls X in the response.
-    a.sync_with_peer(&r_peer, id, true, SYNC_TIMEOUT).await?;
-    drop(c.sync_with_peer(&r_peer, id, true, SYNC_TIMEOUT).await);
+    a.sync_with_peer(&Session::new(r_peer, TEST_LOCAL), id, true, SYNC_TIMEOUT)
+        .await?;
+    drop(
+        c.sync_with_peer(&Session::new(r_peer, TEST_LOCAL), id, true, SYNC_TIMEOUT)
+            .await,
+    );
 
     assert!(
         wait_until(|| async { commit_count(&r, id).await == 1 }).await,

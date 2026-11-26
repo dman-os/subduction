@@ -141,14 +141,8 @@ fn a_fragments_own_head_listed_as_its_checkpoint_stays_a_head() {
     let head = fragment_id(1);
     let tree = Sedimentree::new(
         vec![
-            Fragment::new(
-                SEDIMENTREE_ID,
-                head,
-                BTreeSet::new(),
-                &[head],
-                blob_meta(),
-            )
-            .expect("valid metadata"),
+            Fragment::new(SEDIMENTREE_ID, head, BTreeSet::new(), &[head], blob_meta())
+                .expect("valid metadata"),
         ],
         vec![],
     );

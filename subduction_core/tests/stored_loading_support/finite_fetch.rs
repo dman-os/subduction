@@ -13,7 +13,10 @@ use subduction_core::{
         message::{BatchSyncResponse, RequestedData, SyncDiff, SyncMessage, SyncResult},
         test_utils::{ChannelMockConnection, TokioSpawn, TokioTimeout},
     },
-    peer::id::PeerId,
+    peer::{
+        id::PeerId,
+        session::{Session, TEST_LOCAL},
+    },
     policy::open::OpenPolicy,
     remote_heads::RemoteHeads,
     storage::memory::MemoryStorage,
@@ -121,7 +124,11 @@ async fn finite_fetch_reaches_supplier_despite_four_stalled_candidates() {
         .expect("supplier must complete while the other four candidates remain stalled");
         blobs.sort();
         assert_eq!(blobs, vec![vec![1], vec![2], vec![3]]);
-        assert!(a.get_peer_subscriptions(*supplier_id).await.is_empty());
+        assert!(
+            a.get_peer_subscriptions(Session::new(*supplier_id, TEST_LOCAL))
+                .await
+                .is_empty()
+        );
         stream.close();
         assert!(stream.next().await.is_none());
         a.shutdown();

@@ -68,7 +68,12 @@ async fn managed_websocket_receives_history_and_drains() {
         .unwrap();
     let result = node
         .handle()
-        .sync_with_peer(peer, id, false, CallTimeout::Default)
+        .sync_with_peer(
+            connection.session().expect("authenticated"),
+            id,
+            false,
+            CallTimeout::Default,
+        )
         .await
         .unwrap();
     assert!(result.success);

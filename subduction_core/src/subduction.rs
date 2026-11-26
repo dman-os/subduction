@@ -58,7 +58,7 @@ pub mod error;
 pub mod fragment_batch_item;
 pub mod listener_future;
 mod multiplexer_map;
-pub mod per_peer_sync;
+pub mod per_session_sync;
 pub mod request;
 
 pub mod dispatch_completion;
@@ -67,7 +67,7 @@ pub(crate) mod ingest;
 mod mutation;
 pub(crate) mod peers;
 mod stored;
-pub use peers::{SendPushes, upstream_peers};
+pub use peers::{SendPushes, upstream_sessions};
 pub(crate) mod spawn_guard;
 pub mod upstream_fetch;
 
@@ -93,7 +93,7 @@ use crate::{
     minimized_tree_store::MinimizedTreeStore,
     multiplexer::Multiplexer,
     nonce_cache::NonceCache,
-    peer::{counter::PeerCounter, id::PeerId},
+    peer::{counter::PeerCounter, id::PeerId, session::Session},
     policy::{connection::ConnectionPolicy, storage::StoragePolicy},
     remote_heads::{RemoteHeads, RemoteHeadsNotifier},
     spawn::Spawn,
@@ -125,7 +125,7 @@ use futures::{
 use listener_future::ListenerFuture;
 use multiplexer_map::MultiplexerMap;
 use nonempty::NonEmpty;
-use per_peer_sync::PerPeerSync;
+use per_session_sync::PerSessionSync;
 use request::FragmentRequested;
 use sedimentree_core::{
     blob::{Blob, verified::VerifiedBlobMeta},
@@ -171,7 +171,10 @@ pub struct Subduction<
     minimized_tree_store: E::MinimizedTreeStore,
     storage: StoragePowerbox<E::Storage, E::Policy, Async>,
 
-    /// Active connections, keyed by peer ID.
+    /// Active connections, keyed by [`Session`]: the remote peer and the
+    /// local principal that authenticated the connection. Connections to one
+    /// peer under different principals are different sessions and are never
+    /// substituted for each other.
     ///
     /// Lock ordering: outer lock relative to
     /// [`multiplexers`](Self::multiplexers) and
@@ -182,14 +185,14 @@ pub struct Subduction<
     /// never observed half-applied.
     ///
     /// [`register_connection`]: Self::register_connection
-    connections: Arc<Mutex<Map<PeerId, NonEmpty<Authenticated<Conn, Async>>>>>,
+    connections: Arc<Mutex<Map<Session, NonEmpty<Authenticated<Conn, Async>>>>>,
 
     /// Broadcast wakeups for active loaders to reconcile connection generations.
     connections_changed: Arc<event_listener::Event>,
 
     /// Per-connection multiplexers for request-response correlation.
     ///
-    /// Keyed by peer ID, with one [`Multiplexer`] per connection. Used by
+    /// Keyed by [`Session`], with one [`Multiplexer`] per connection. Used by
     /// [`sync_with_peer`](Self::sync_with_peer) to make roundtrip calls
     /// and by the listen loop to route [`BatchSyncResponse`] messages.
     ///
@@ -205,19 +208,19 @@ pub struct Subduction<
     /// holds no clock. See [`DEFAULT_ROUNDTRIP_TIMEOUT`](crate::multiplexer::DEFAULT_ROUNDTRIP_TIMEOUT).
     default_roundtrip_timeout: Duration,
 
-    subscriptions: Arc<Mutex<Map<SedimentreeId, Set<PeerId>>>>,
+    subscriptions: Arc<Mutex<Map<SedimentreeId, Set<Session>>>>,
     nonce_tracker: Arc<NonceCache>,
 
     /// Backoff state per connection, keyed by [`ConnectionId`].
     reconnect_backoff: Arc<Mutex<Map<ConnectionId, Backoff>>>,
 
     /// Outgoing-subscription claims: the sedimentrees this node has (or is
-    /// establishing) an upstream subscription to via each peer. Doubles as
+    /// establishing) an upstream subscription to via each session. Doubles as
     /// the dedup/claim map for concurrent propagation.
     ///
     /// See [`propagate_subscription`](Self::propagate_subscription) for the
     /// claim lifecycle.
-    outgoing_subscriptions: Arc<Mutex<Map<PeerId, Set<SedimentreeId>>>>,
+    outgoing_subscriptions: Arc<Mutex<Map<Session, Set<SedimentreeId>>>>,
 
     /// Upstream fetches in flight for locally missing documents, shared by
     /// concurrent inbound subscribes. See
@@ -337,8 +340,8 @@ where
         discovery_id: Option<DiscoveryId>,
         signer: Sign,
         minimized_tree_store: Trees,
-        connections: Arc<Mutex<Map<PeerId, NonEmpty<Authenticated<Conn, Async>>>>>,
-        subscriptions: Arc<Mutex<Map<SedimentreeId, Set<PeerId>>>>,
+        connections: Arc<Mutex<Map<Session, NonEmpty<Authenticated<Conn, Async>>>>>,
+        subscriptions: Arc<Mutex<Map<SedimentreeId, Set<Session>>>>,
         storage: StoragePowerbox<Store, Policy, Async>,
         send_counter: PeerCounter,
         nonce_cache: NonceCache,
@@ -399,8 +402,8 @@ where
         discovery_id: Option<DiscoveryId>,
         signer: E::Signer,
         minimized_tree_store: E::MinimizedTreeStore,
-        connections: Arc<Mutex<Map<PeerId, NonEmpty<Authenticated<Conn, Async>>>>>,
-        subscriptions: Arc<Mutex<Map<SedimentreeId, Set<PeerId>>>>,
+        connections: Arc<Mutex<Map<Session, NonEmpty<Authenticated<Conn, Async>>>>>,
+        subscriptions: Arc<Mutex<Map<SedimentreeId, Set<Session>>>>,
         storage: StoragePowerbox<E::Storage, E::Policy, Async>,
         send_counter: PeerCounter,
         nonce_cache: NonceCache,
@@ -511,16 +514,16 @@ where
         self.depth_metric.to_depth(commit_id)
     }
 
-    /// Get a connection to a peer, if one exists.
+    /// Get a connection of a session, if one exists.
     ///
-    /// Returns the first available connection to the peer. Use this to get a
-    /// connection once and reuse it for multiple operations, avoiding repeated
-    /// lock acquisition on the connections map.
-    pub async fn get_connection(&self, peer_id: &PeerId) -> Option<Authenticated<Conn, Async>> {
+    /// Returns the first available connection of the session. Use this to get
+    /// a connection once and reuse it for multiple operations, avoiding
+    /// repeated lock acquisition on the connections map.
+    pub async fn get_connection(&self, session: &Session) -> Option<Authenticated<Conn, Async>> {
         self.connections
             .lock()
             .await
-            .get(peer_id)
+            .get(session)
             .map(|ne| ne.head.clone())
     }
 
@@ -537,24 +540,24 @@ where
         backoff.next_delay()
     }
 
-    /// Get the outgoing-subscription claims held toward a peer: the
+    /// Get the outgoing-subscription claims held toward a session: the
     /// sedimentrees this node has (or is establishing) an upstream
-    /// subscription to via that peer.
+    /// subscription to via that session.
     ///
     /// Observability accessor (used by integration tests). See
     /// [`propagate_subscription`] for the claim lifecycle.
     ///
     /// [`propagate_subscription`]: Self::propagate_subscription
-    pub async fn get_peer_subscriptions(&self, peer_id: PeerId) -> Set<SedimentreeId> {
+    pub async fn get_peer_subscriptions(&self, session: Session) -> Set<SedimentreeId> {
         self.outgoing_subscriptions
             .lock()
             .await
-            .get(&peer_id)
+            .get(&session)
             .cloned()
             .unwrap_or_default()
     }
 
-    /// Get the peers subscribed to a sedimentree on this node: the inbound
+    /// Get the sessions subscribed to a sedimentree on this node: the inbound
     /// side of [`get_peer_subscriptions`](Self::get_peer_subscriptions).
     ///
     /// This is the raw subscription set; the push path additionally filters
@@ -562,7 +565,7 @@ where
     /// accessor (used by integration tests).
     ///
     /// [`StoragePolicy::filter_authorized_fetch`]: crate::policy::storage::StoragePolicy::filter_authorized_fetch
-    pub async fn get_subscribers(&self, sedimentree_id: SedimentreeId) -> Set<PeerId> {
+    pub async fn get_subscribers(&self, sedimentree_id: SedimentreeId) -> Set<Session> {
         self.subscriptions
             .lock()
             .await
@@ -644,17 +647,17 @@ where
         self.reconnect_backoff.lock().await.remove(&conn_id);
     }
 
-    /// Record an established outgoing-subscription claim toward a peer.
+    /// Record an established outgoing-subscription claim toward a session.
     ///
     /// Called internally when `sync_with_peer` establishes a subscription
     /// (`subscribe: true`). See
     /// [`propagate_subscription`](Self::propagate_subscription) for the
     /// claim lifecycle.
-    async fn track_outgoing_subscription(&self, peer_id: PeerId, sedimentree_id: SedimentreeId) {
+    async fn track_outgoing_subscription(&self, session: Session, sedimentree_id: SedimentreeId) {
         self.outgoing_subscriptions
             .lock()
             .await
-            .entry(peer_id)
+            .entry(session)
             .or_default()
             .insert(sedimentree_id);
     }
@@ -734,28 +737,30 @@ where
         Ok(())
     }
 
-    /// Gracefully disconnect from all connections to a given peer ID.
+    /// Gracefully disconnect from all connections of a session. Other
+    /// sessions to the same peer, authenticated as other local principals,
+    /// are left open.
     ///
     /// # Returns
     ///
     /// * `Ok(true)` if at least one connection was found and disconnected.
-    /// * `Ok(false)` if no connections to the given peer ID were found.
+    /// * `Ok(false)` if no connections of the given session were found.
     ///
     /// # Errors
     ///
     /// * Returns `Conn::DisconnectionError` if disconnect fails or it occurs ungracefully.
     pub async fn disconnect_from_peer(
         &self,
-        peer_id: &PeerId,
+        session: &Session,
     ) -> Result<bool, Conn::DisconnectionError> {
-        // Remove the peer's connections and detach its muxes in one
+        // Remove the session's connections and detach its muxes in one
         // `connections` critical section (outer before inner) so a
         // concurrent reconnect can't be clobbered.
         let removed = {
             let mut connections = self.connections.lock().await;
             let mut multiplexers = self.multiplexers.lock().await;
-            connections.remove(peer_id).map(|conns| {
-                let muxes = multiplexers.detach_peer(peer_id);
+            connections.remove(session).map(|conns| {
+                let muxes = multiplexers.detach_session(session);
                 self.connections_changed.notify(usize::MAX);
                 (conns, muxes)
             })
@@ -763,12 +768,12 @@ where
 
         if let Some((conns, muxes)) = removed {
             // Removing every connection is by definition removing the last.
-            self.teardown_peer(peer_id, muxes, conns.len()).await;
+            self.teardown_session(session, muxes, conns.len()).await;
             self.refresh_connection_gauge().await;
 
             for conn in conns {
                 if let Err(e) = conn.disconnect().await {
-                    tracing::error!(peer = %peer_id, error = %e, "failed to disconnect connection");
+                    tracing::error!(%session, error = %e, "failed to disconnect connection");
                     return Err(e);
                 }
             }
@@ -786,7 +791,7 @@ where
     ///
     /// # Returns
     ///
-    /// * `Ok(true)` if the connection is fresh (first for this peer or new connection).
+    /// * `Ok(true)` if the connection is fresh (first for this session or new connection).
     /// * `Ok(false)` if the exact connection was already added.
     ///
     /// # Errors
@@ -797,7 +802,7 @@ where
         conn: Authenticated<Conn, Async>,
     ) -> Result<bool, AddConnectionError<ConnectionDisallowed<Async, E>>> {
         let peer_id = conn.peer_id();
-        tracing::info!(peer = %peer_id, "adding connection from peer");
+        tracing::info!(session = %conn.session(), "adding connection");
 
         self.storage
             .policy()
@@ -840,33 +845,36 @@ where
     /// Returns `false` (without inserting) if this exact connection is
     /// already tracked.
     async fn register_connection(&self, conn: &Authenticated<Conn, Async>) -> bool {
-        let peer_id = conn.peer_id();
+        let session = conn.session();
         let mut connections = self.connections.lock().await;
 
         if connections
-            .get(&peer_id)
-            .is_some_and(|peer_conns| peer_conns.iter().any(|c| c == conn))
+            .get(&session)
+            .is_some_and(|session_conns| session_conns.iter().any(|c| c == conn))
         {
             return false;
         }
 
-        let newly_present = if let Some(peer_conns) = connections.get_mut(&peer_id) {
-            peer_conns.push(conn.clone());
+        let newly_present = if let Some(session_conns) = connections.get_mut(&session) {
+            session_conns.push(conn.clone());
             false
         } else {
-            connections.insert(peer_id, NonEmpty::new(conn.clone()));
+            connections.insert(session, NonEmpty::new(conn.clone()));
             true
         };
 
-        // While `connections` is held: the peer only becomes visible to
+        // While `connections` is held: the session only becomes visible to
         // `propagate_subscription` when the guard drops, so a stale claim
         // cannot suppress a propagation for this arrival.
         if newly_present {
-            self.clear_stale_outgoing_claims(&peer_id).await;
-            peers::remove_peer_from_subscriptions(&self.subscriptions, peer_id).await;
+            self.clear_stale_outgoing_claims(&session).await;
+            peers::remove_session_from_subscriptions(&self.subscriptions, session).await;
         }
 
-        let mux = Arc::new(Multiplexer::new(peer_id, self.default_roundtrip_timeout));
+        let mux = Arc::new(Multiplexer::new(
+            conn.peer_id(),
+            self.default_roundtrip_timeout,
+        ));
         self.multiplexers.lock().await.insert(conn.clone(), mux);
         self.connections_changed.notify(usize::MAX);
 
@@ -875,8 +883,8 @@ where
 
     /// Remove a failed connection and schedule its async disconnection.
     ///
-    /// Returns `Some(true)` if this was the last connection for the peer,
-    /// `Some(false)` if the peer still has connections,
+    /// Returns `Some(true)` if this was the last connection of the session,
+    /// `Some(false)` if the session still has connections,
     /// `None` if the connection wasn't found.
     ///
     /// Crate-internal: driven by the listen loop and broadcast-failure
@@ -902,26 +910,26 @@ where
         conn: &Authenticated<Conn, Async>,
         cleanup: Option<Async::Future<'static, ()>>,
     ) -> Option<bool> {
-        let peer_id = conn.peer_id();
+        let session = conn.session();
 
         let (last, detached) = {
             let mut connections = self.connections.lock().await;
             // Acquire both locks before mutating either map. After removal,
             // there must be no suspension before the cleanup handoff.
             let mut multiplexers = self.multiplexers.lock().await;
-            let last = match connections.remove(&peer_id)?.remove_item(conn) {
+            let last = match connections.remove(&session)?.remove_item(conn) {
                 RemoveResult::Removed(remaining) => {
-                    connections.insert(peer_id, remaining);
+                    connections.insert(session, remaining);
                     false
                 }
                 RemoveResult::WasLast(_) => true,
                 RemoveResult::NotFound(original) => {
-                    connections.insert(peer_id, original);
+                    connections.insert(session, original);
                     return None;
                 }
             };
             let detached = if last {
-                multiplexers.detach_peer(&peer_id)
+                multiplexers.detach_session(&session)
             } else {
                 multiplexers.detach_connection(conn)
             };
@@ -934,7 +942,7 @@ where
             self.spawner.spawn(cleanup);
         }
         if last {
-            self.teardown_peer(&peer_id, detached, 1).await;
+            self.teardown_session(&session, detached, 1).await;
         } else {
             Self::cancel_detached_muxes(detached).await;
             #[cfg(feature = "metrics")]
@@ -979,44 +987,44 @@ where
     }
 
     /// Invalidate outgoing-subscription claims from a previous connection
-    /// era, on the peer's absent → present transition. The remote forgot
+    /// era, on the session's absent → present transition. The remote forgot
     /// our subscriptions when the old connection died; a surviving claim
     /// would suppress re-propagation, silently unsubscribing this node
     /// upstream. Clearing on arrival (not only teardown) survives skipped
     /// or interrupted teardowns.
     ///
-    /// Callers must hold the `connections` guard that inserts the peer.
+    /// Callers must hold the `connections` guard that inserts the session.
     /// The `connections → outgoing_subscriptions` nesting edge is acyclic.
     ///
-    /// Two windows remain open (candidates for per-peer era tagging): a
+    /// Two windows remain open (candidates for per-session era tagging): a
     /// crash + reconnect before the old closure event drains never goes
     /// absent, and an in-flight `propagate_subscription` can re-insert a
     /// claim after the era was cleared.
-    async fn clear_stale_outgoing_claims(&self, peer_id: &PeerId) {
-        self.outgoing_subscriptions.lock().await.remove(peer_id);
+    async fn clear_stale_outgoing_claims(&self, session: &Session) {
+        self.outgoing_subscriptions.lock().await.remove(session);
     }
 
-    /// Finish per-peer teardown after the peer's last connection is gone
+    /// Finish per-session teardown after the session's last connection is gone
     /// and its muxes have been detached under the connections and mux-map locks.
     ///
     /// Shared post-lock cleanup for [`disconnect`](Self::disconnect) and
     /// [`disconnect_from_peer`](Self::disconnect_from_peer) so they clean
     /// up the same state in the same order. Emits `conn_count`
     /// `connection_closed` metrics.
-    async fn teardown_peer(
+    async fn teardown_session(
         &self,
-        peer_id: &PeerId,
+        session: &Session,
         muxes: Vec<Arc<Multiplexer>>,
         conn_count: usize,
     ) {
         Self::cancel_detached_muxes(muxes).await;
         {
-            // It's possible that a new connection to the same peer was added
+            // It's possible that a new connection to the same session was added
             // just before the caller called us, in that case we do nothing
             let connections = self.connections.lock().await;
-            if !connections.contains_key(peer_id) {
-                peers::remove_peer_from_subscriptions(&self.subscriptions, *peer_id).await;
-                self.outgoing_subscriptions.lock().await.remove(peer_id);
+            if !connections.contains_key(session) {
+                peers::remove_session_from_subscriptions(&self.subscriptions, *session).await;
+                self.outgoing_subscriptions.lock().await.remove(session);
             }
         }
 
@@ -1033,9 +1041,9 @@ where
         let _ = conn_count;
     }
 
-    /// Add a subscription for a peer to a sedimentree.
-    pub(crate) async fn add_subscription(&self, peer_id: PeerId, sedimentree_id: SedimentreeId) {
-        peers::add_subscription(&self.subscriptions, peer_id, sedimentree_id).await;
+    /// Add a subscription for a session to a sedimentree.
+    pub(crate) async fn add_subscription(&self, session: Session, sedimentree_id: SedimentreeId) {
+        peers::add_subscription(&self.subscriptions, session, sedimentree_id).await;
     }
 
     /// Get connections for subscribers authorized to receive updates for a sedimentree.
@@ -1750,7 +1758,7 @@ where
     /// [`sync_with_all_peers`](Self::sync_with_all_peers).
     ///
     /// Awaits the broadcast and returns its per-peer outcome
-    /// ([`PerPeerSync`]); a wedged peer can stall this for up to `timeout`
+    /// ([`PerSessionSync`]); a wedged peer can stall this for up to `timeout`
     /// ([`CallTimeout::Default`] = configured `roundtrip_timeout`). For a
     /// durable write that does not wait on peers, use
     /// [`store_sedimentree`](Self::store_sedimentree) and drive sync
@@ -1770,7 +1778,7 @@ where
         blobs: Vec<Blob>,
         timeout: CallTimeout,
     ) -> Result<
-        PerPeerSync<Conn, Async, <Conn as Connection<Async, Hdl::Message>>::SendError>,
+        PerSessionSync<Conn, Async, <Conn as Connection<Async, Hdl::Message>>::SendError>,
         WriteError<Async, E::Storage, Conn, Hdl::Message, E::PutDisallowed>,
     > {
         self.store_sedimentree(id, sedimentree, blobs).await?;
@@ -1792,7 +1800,7 @@ where
     /// want both phases in one call.
     ///
     /// This **awaits the broadcast** and returns its per-peer outcome
-    /// ([`PerPeerSync`]). A byte-connected but protocol-unresponsive peer
+    /// ([`PerSessionSync`]). A byte-connected but protocol-unresponsive peer
     /// can therefore stall this call for up to `timeout` (or the
     /// configured `roundtrip_timeout` for [`CallTimeout::Default`]). Callers that need
     /// the durable write to return *without* waiting on peers should call
@@ -1818,7 +1826,7 @@ where
     ///   [`BlobMeta`](sedimentree_core::blob::BlobMeta).
     ///
     /// Per-peer transport failures during the broadcast are *not* surfaced as
-    /// `Err`; they appear in the returned [`PerPeerSync`] map (per-peer
+    /// `Err`; they appear in the returned [`PerSessionSync`] map (per-peer
     /// success flag + per-connection
     /// [`CallError`]s).
     ///
@@ -1831,11 +1839,11 @@ where
         fragments: Vec<(Fragment, Blob)>,
         timeout: CallTimeout,
     ) -> Result<
-        PerPeerSync<Conn, Async, <Conn as Connection<Async, Hdl::Message>>::SendError>,
+        PerSessionSync<Conn, Async, <Conn as Connection<Async, Hdl::Message>>::SendError>,
         WriteError<Async, E::Storage, Conn, Hdl::Message, E::PutDisallowed>,
     > {
         if commits.is_empty() && fragments.is_empty() {
-            return Ok(PerPeerSync::default());
+            return Ok(PerSessionSync::default());
         }
 
         // Storage write first (cancel-safety: storage is the source of truth;
@@ -1857,7 +1865,7 @@ where
     /// broadcast, instead of re-minimizing and pushing per commit.
     ///
     /// This **awaits the broadcast** and returns its per-peer outcome
-    /// ([`PerPeerSync`]); a byte-connected but protocol-unresponsive peer can
+    /// ([`PerSessionSync`]); a byte-connected but protocol-unresponsive peer can
     /// stall the call for up to `timeout` (or the configured
     /// `roundtrip_timeout` for [`CallTimeout::Default`]). Callers that want the
     /// durable write to return *without* waiting on peers should call
@@ -1872,7 +1880,7 @@ where
     ///   trailing broadcast hits a storage error.
     ///
     /// Per-peer transport failures during the broadcast are *not* surfaced as
-    /// `Err`; they appear in the returned [`PerPeerSync`] map.
+    /// `Err`; they appear in the returned [`PerSessionSync`] map.
     ///
     /// Note: `WriteError::PutDisallowed` is unreachable for local writes
     /// (the node trusts itself via [`local_putter`](crate::storage::powerbox::StoragePowerbox::local_putter)).
@@ -1882,11 +1890,11 @@ where
         commits: Vec<(CommitId, BTreeSet<CommitId>, Blob)>,
         timeout: CallTimeout,
     ) -> Result<
-        PerPeerSync<Conn, Async, <Conn as Connection<Async, Hdl::Message>>::SendError>,
+        PerSessionSync<Conn, Async, <Conn as Connection<Async, Hdl::Message>>::SendError>,
         WriteError<Async, E::Storage, Conn, Hdl::Message, E::PutDisallowed>,
     > {
         if commits.is_empty() {
-            return Ok(PerPeerSync::default());
+            return Ok(PerSessionSync::default());
         }
 
         self.store_commits_batch(id, commits).await?;
@@ -1906,7 +1914,7 @@ where
     /// broadcast, instead of re-minimizing and pushing per fragment.
     ///
     /// This **awaits the broadcast** and returns its per-peer outcome
-    /// ([`PerPeerSync`]); a byte-connected but protocol-unresponsive peer can
+    /// ([`PerSessionSync`]); a byte-connected but protocol-unresponsive peer can
     /// stall the call for up to `timeout` (or the configured
     /// `roundtrip_timeout` for [`CallTimeout::Default`]). Callers that want the
     /// durable write to return *without* waiting on peers should call
@@ -1921,7 +1929,7 @@ where
     ///   trailing broadcast hits a storage error.
     ///
     /// Per-peer transport failures during the broadcast are *not* surfaced as
-    /// `Err`; they appear in the returned [`PerPeerSync`] map.
+    /// `Err`; they appear in the returned [`PerSessionSync`] map.
     ///
     /// Note: `WriteError::PutDisallowed` is unreachable for local writes
     /// (the node trusts itself via [`local_putter`](crate::storage::powerbox::StoragePowerbox::local_putter)).
@@ -1931,11 +1939,11 @@ where
         fragments: Vec<FragmentBatchItem>,
         timeout: CallTimeout,
     ) -> Result<
-        PerPeerSync<Conn, Async, <Conn as Connection<Async, Hdl::Message>>::SendError>,
+        PerSessionSync<Conn, Async, <Conn as Connection<Async, Hdl::Message>>::SendError>,
         WriteError<Async, E::Storage, Conn, Hdl::Message, E::PutDisallowed>,
     > {
         if fragments.is_empty() {
-            return Ok(PerPeerSync::default());
+            return Ok(PerSessionSync::default());
         }
 
         self.store_fragments_batch(id, fragments).await?;
@@ -1946,12 +1954,12 @@ where
         Ok(per_peer)
     }
 
-    /// Forward an inbound subscription for `id` to every peer this node
+    /// Forward an inbound subscription for `id` to every session this node
     /// dialed ([`Direction::Dialed`](crate::authenticated::Direction::Dialed))
-    /// other than `originator`, via [`sync_with_peer`](Self::sync_with_peer)
-    /// with `subscribe = true`. Upstream is a property of the peer, not the
-    /// socket: a peer we dialed on any connection counts. Peers that only
-    /// dialed us are never subscribed on a third party's behalf. Best-effort; per-peer errors are logged. See
+    /// whose remote is not `originator`, via [`sync_with_peer`](Self::sync_with_peer)
+    /// with `subscribe = true`. Upstream is a property of the session, not the
+    /// socket: a session we dialed on any connection counts. Peers that only
+    /// dialed us are never subscribed on a third party's behalf. Best-effort; per-session errors are logged. See
     /// `design/sync/subscriptions.md#upstream-propagation-relay-topologies`.
     ///
     /// # Concurrency
@@ -1971,7 +1979,7 @@ where
     ///
     /// # Lifecycle
     ///
-    /// Claims live for the target peer's connection era: invalidated on
+    /// Claims live for the target session's connection era: invalidated on
     /// its next absent → present transition
     /// ([`clear_stale_outgoing_claims`]), dropped at teardown as GC, and
     /// re-established by a later inbound subscribe. There is no
@@ -1981,37 +1989,37 @@ where
     ///
     /// [`outgoing_subscriptions`]: Self::outgoing_subscriptions
     pub(crate) async fn propagate_subscription(&self, id: SedimentreeId, originator: PeerId) {
-        let peers: Vec<PeerId> = {
+        let sessions: Vec<Session> = {
             let conns = self.connections.lock().await;
-            peers::upstream_peers(
+            peers::upstream_sessions(
                 conns
                     .iter()
-                    .map(|(peer, conns)| (*peer, conns.iter().map(Authenticated::direction))),
+                    .map(|(session, conns)| (*session, conns.iter().map(Authenticated::direction))),
                 originator,
             )
         };
 
-        if peers.is_empty() {
+        if sessions.is_empty() {
             return;
         }
 
         // Claim each pair under one lock (see `# Concurrency`); the lock
         // is never held across the `sync_with_peer` awaits below.
-        let to_propagate: Vec<PeerId> = {
+        let to_propagate: Vec<Session> = {
             let mut subs = self.outgoing_subscriptions.lock().await;
-            peers
+            sessions
                 .into_iter()
-                .filter(|peer| subs.entry(*peer).or_default().insert(id))
+                .filter(|session| subs.entry(*session).or_default().insert(id))
                 .collect()
         };
 
         let mut propagations: FuturesUnordered<_> = to_propagate
             .into_iter()
-            .map(|peer| async move {
-                tracing::debug!(tree = ?id, peer = %peer, "propagating subscription upstream to peer");
+            .map(|session| async move {
+                tracing::debug!(tree = ?id, %session, "propagating subscription upstream to session");
 
                 let established = match self
-                    .sync_with_peer(&peer, id, true, CallTimeout::Default)
+                    .sync_with_peer(&session, id, true, CallTimeout::Default)
                     .await
                 {
                     Ok((had_success, _, _)) => {
@@ -2024,39 +2032,44 @@ where
                         had_success
                     }
                     Err(e) => {
-                        tracing::debug!(peer = %peer, tree = ?id, error = %e, "subscribe propagation failed");
+                        tracing::debug!(%session, tree = ?id, error = %e, "subscribe propagation failed");
                         #[cfg(feature = "metrics")]
                         crate::metrics::subscription_propagation("failed");
                         false
                     }
                 };
-                (peer, established)
+                (session, established)
             })
             .collect();
 
-        while let Some((peer, established)) = propagations.next().await {
+        while let Some((session, established)) = propagations.next().await {
             if !established {
                 let mut subs = self.outgoing_subscriptions.lock().await;
-                if let Some(set) = subs.get_mut(&peer) {
+                if let Some(set) = subs.get_mut(&session) {
                     set.remove(&id);
                     if set.is_empty() {
-                        subs.remove(&peer);
+                        subs.remove(&session);
                     }
                 }
             }
         }
     }
 
-    /// Request a batch sync from a given peer for a given sedimentree ID.
+    /// Request a batch sync from a given peer, over the named session, for a
+    /// given sedimentree ID.
+    ///
+    /// The request only ever goes over connections of `to_ask`; a connection
+    /// to the same peer authenticated as another local principal is never
+    /// tried, because the peer authorizes each session by its own principal.
     ///
     /// # Returns
     ///
     /// A tuple `(succeeded, stats, per-connection call errors)`: `succeeded`
-    /// is `true` if at least one connection to the peer synced successfully;
+    /// is `true` if at least one connection of the session synced successfully;
     /// `stats` aggregates the sync; and the [`Vec`] carries per-connection
     /// [`CallError`]s for connections
     /// that failed. `succeeded = false` with an empty error list means no
-    /// connections to the peer were available, local policy denied disclosure,
+    /// connections of the session were available, local policy denied disclosure,
     /// or the peer returned `NotFound`/`Unauthorized`. Local policy is checked
     /// before sending the document ID or inventory.
     ///
@@ -2073,11 +2086,11 @@ where
         name = "sync_with_peer",
         level = "debug",
         skip_all,
-        fields(peer = %to_ask, tree = ?id, subscribe)
+        fields(session = %to_ask, tree = ?id, subscribe)
     )]
     pub async fn sync_with_peer(
         &self,
-        to_ask: &PeerId,
+        to_ask: &Session,
         id: SedimentreeId,
         subscribe: bool,
         timeout: CallTimeout,
@@ -2100,20 +2113,20 @@ where
     #[allow(clippy::type_complexity)]
     async fn sync_peer(
         &self,
-        to_ask: &PeerId,
+        to_ask: &Session,
         id: SedimentreeId,
         subscribe: bool,
         timeout: CallTimeout,
     ) -> Result<
         (
-            per_peer_sync::PeerSyncEntry<Conn, Async, Conn::SendError>,
+            per_session_sync::PeerSyncEntry<Conn, Async, Conn::SendError>,
             bool,
         ),
         IoError<Async, E::Storage, Conn, Hdl::Message>,
     > {
         let timeout = timeout.resolve(self.default_roundtrip_timeout);
 
-        tracing::info!(tree = ?id, peer = %to_ask, "requesting batch sync for sedimentree");
+        tracing::info!(tree = ?id, session = %to_ask, "requesting batch sync for sedimentree");
 
         #[cfg(feature = "metrics")]
         let sync_start = std::time::Instant::now();
@@ -2173,15 +2186,15 @@ where
         Ok(((had_success, stats, conn_errs), supplied))
     }
 
-    /// Request a batch sync from all connected peers authorized to fetch the
-    /// given sedimentree. Denied peers receive no request and report
-    /// `succeeded = false` without a connection error.
+    /// Request a batch sync over every connected session whose remote peer is
+    /// authorized to fetch the given sedimentree. Denied sessions receive no
+    /// request and report `succeeded = false` without a connection error.
     ///
     /// # Returns
     ///
-    /// A [`PerPeerSync`] map keyed by [`PeerId`]; each entry is
+    /// A [`PerSessionSync`] map keyed by [`Session`]; each entry is
     /// `(succeeded, stats, per-connection call errors)`, so callers can see
-    /// which peers acked and which failed. Peers that could not be reached
+    /// which sessions acked and which failed. Sessions that could not be reached
     /// appear with `succeeded = false` and/or per-connection
     /// [`CallError`]s. An empty map
     /// means no peers were connected.
@@ -2207,19 +2220,19 @@ where
         subscribe: bool,
         timeout: CallTimeout,
     ) -> Result<
-        PerPeerSync<Conn, Async, <Conn as Connection<Async, Hdl::Message>>::SendError>,
+        PerSessionSync<Conn, Async, <Conn as Connection<Async, Hdl::Message>>::SendError>,
         IoError<Async, E::Storage, Conn, Hdl::Message>,
     > {
         // Resolve caller policy to the low-level deadline (`None` = uncapped).
         let timeout = timeout.resolve(self.default_roundtrip_timeout);
 
         tracing::info!(tree = ?id, "requesting batch sync for sedimentree from all peers");
-        let peers: Map<PeerId, Vec<Authenticated<Conn, Async>>> = {
+        let peers: Map<Session, Vec<Authenticated<Conn, Async>>> = {
             self.connections
                 .lock()
                 .await
                 .iter()
-                .map(|(peer_id, conns)| (*peer_id, conns.iter().cloned().collect()))
+                .map(|(session, conns)| (*session, conns.iter().cloned().collect()))
                 .collect()
         };
         tracing::debug!(count = peers.len(), "found peer(s)");
@@ -2231,7 +2244,7 @@ where
 
         let mut set: FuturesUnordered<_> = peers
             .iter()
-            .map(|(peer_id, peer_conns)| {
+            .map(|(session, peer_conns)| {
                 let shared_tree = shared_tree.clone();
                 async move {
                     tracing::debug!(
@@ -2260,13 +2273,13 @@ where
 
                     Ok::<
                         (
-                            PeerId,
+                            Session,
                             bool,
                             SyncStats,
                             Vec<(Authenticated<Conn, Async>, _)>,
                         ),
                         IoError<Async, E::Storage, Conn, Hdl::Message>,
-                    >((*peer_id, had_success, stats, conn_errs))
+                    >((*session, had_success, stats, conn_errs))
                 }
             })
             .collect();
@@ -2277,12 +2290,12 @@ where
                 Err(e) => {
                     tracing::error!(error = %e, "per-peer sync task failed");
                 }
-                Ok((peer_id, success, stats, errs)) => {
-                    out.insert(peer_id, (success, stats, errs));
+                Ok((session, success, stats, errs)) => {
+                    out.insert(session, (success, stats, errs));
                 }
             }
         }
-        Ok(PerPeerSync::new(out))
+        Ok(PerSessionSync::new(out))
     }
 
     /// Sync the exact connection generation observed by a live loader, rather
@@ -2372,7 +2385,8 @@ where
         Result<Option<bool>, CallError<Conn::SendError>>,
         IoError<Async, E::Storage, Conn, Hdl::Message>,
     > {
-        let peer = conn.peer_id();
+        let session = conn.session();
+        let peer = session.remote();
         // A sync request discloses the document ID and local inventory even
         // when no content is sent. Gate every outgoing round, including loader
         // connections and forwarded subscriptions, before constructing it.
@@ -2463,8 +2477,8 @@ where
             }
         }
         if subscribe {
-            self.track_outgoing_subscription(peer, id).await;
-            self.add_subscription(peer, id).await;
+            self.track_outgoing_subscription(session, id).await;
+            self.add_subscription(session, id).await;
         }
         Ok(Ok(Some(ingested.stored_content)))
     }
@@ -2646,9 +2660,22 @@ where
         out
     }
 
-    /// Get the set of all connected peer IDs.
-    pub async fn connected_peer_ids(&self) -> Set<PeerId> {
+    /// Get the set of all connected sessions.
+    pub async fn connected_sessions(&self) -> Set<Session> {
         self.connections.lock().await.keys().copied().collect()
+    }
+
+    /// Get the set of remote peers with at least one connected session.
+    ///
+    /// A peer reached under several local principals appears once. Use
+    /// [`connected_sessions`](Self::connected_sessions) to address a peer.
+    pub async fn connected_peer_ids(&self) -> Set<PeerId> {
+        self.connections
+            .lock()
+            .await
+            .keys()
+            .map(Session::remote)
+            .collect()
     }
 
     /// The total number of active connections across all peers.
@@ -3167,7 +3194,7 @@ where
                                 );
 
                                 if self.remove_connection(&conn).await == Some(true) {
-                                    handler.on_peer_disconnect(peer_id).await;
+                                    handler.on_peer_disconnect(conn.session()).await;
                                 }
                                 tracing::debug!(peer = %peer_id, "removed failed connection");
                             }
@@ -3223,7 +3250,7 @@ where
                         let peer_id = conn.peer_id();
                         tracing::warn!(conn = %conn_id, peer = %peer_id, "connection closed, removing");
                         if self.remove_connection(&conn).await == Some(true) {
-                            handler.on_peer_disconnect(peer_id).await;
+                            handler.on_peer_disconnect(conn.session()).await;
                         }
                     } else {
                         // Must break: a permanently-ready arm above
@@ -3312,7 +3339,8 @@ where
         Ok(())
     }
 
-    /// Sync all known [`Sedimentree`]s with a single peer.
+    /// Sync all known [`Sedimentree`]s with a single peer, over the named
+    /// session.
     ///
     /// This is the single-peer counterpart of [`full_sync_with_all_peers`](Self::full_sync_with_all_peers).
     /// Each document's sync is **spawned onto the runtime** (via the configured
@@ -3334,11 +3362,11 @@ where
         name = "full_sync_with_peer",
         level = "debug",
         skip_all,
-        fields(peer = %peer_id, subscribe)
+        fields(session = %session, subscribe)
     )]
     pub async fn full_sync_with_peer(
         self: &Arc<Self>,
-        peer_id: &PeerId,
+        session: &Session,
         subscribe: bool,
         timeout: CallTimeout,
     ) -> (
@@ -3353,7 +3381,7 @@ where
             IoError<Async, E::Storage, Conn, Hdl::Message>,
         )>,
     ) {
-        tracing::info!(peer = %peer_id, "requesting batch sync for all sedimentrees with peer");
+        tracing::info!(%session, "requesting batch sync for all sedimentrees with peer");
         // Enumerate from storage (complete across evictions), mirroring
         // `full_sync_with_all_peers`. Using the resident set here would
         // silently skip cold/evicted documents, contradicting "all known".
@@ -3382,7 +3410,7 @@ where
         for id in tree_ids {
             guard.push(self.spawner.spawn(Async::doc_sync_task(
                 Arc::clone(self),
-                *peer_id,
+                *session,
                 id,
                 subscribe,
                 timeout,
@@ -3410,7 +3438,7 @@ where
                     call_errs.extend(step_errs);
                 }
                 Err(e) => {
-                    tracing::error!(tree = ?done_id, peer = %peer_id, error = %e, "failed to sync sedimentree with peer");
+                    tracing::error!(tree = ?done_id, %session, error = %e, "failed to sync sedimentree with peer");
                     io_errs.push((done_id, e));
                 }
             }
@@ -3466,35 +3494,35 @@ impl<
     Metric: DepthMetric,
 > Subduction<'a, Async, E, Conn, Hdl, Metric>
 {
-    /// Number of multiplexers currently registered for `peer_id`.
+    /// Number of multiplexers currently registered for `session`.
     ///
     /// One multiplexer is created per connection, so at a quiescent point
     /// this equals [`connection_count`](Self::connection_count).
-    pub async fn mux_count(&self, peer_id: &PeerId) -> usize {
-        self.multiplexers.lock().await.count(peer_id)
+    pub async fn mux_count(&self, session: &Session) -> usize {
+        self.multiplexers.lock().await.count(session)
     }
 
-    /// Number of connections currently registered for `peer_id`.
-    pub async fn connection_count(&self, peer_id: &PeerId) -> usize {
+    /// Number of connections currently registered for `session`.
+    pub async fn connection_count(&self, session: &Session) -> usize {
         self.connections
             .lock()
             .await
-            .get(peer_id)
+            .get(session)
             .map_or(0, NonEmpty::len)
     }
 
-    /// Whether the connection/multiplexer invariant holds for `peer_id`:
-    /// a connected peer has at least one multiplexer, and a disconnected
-    /// peer has none.
+    /// Whether the connection/multiplexer invariant holds for `session`:
+    /// a connected session has at least one multiplexer, and a disconnected
+    /// session has none.
     ///
     /// This is the presence/absence form the `expect("multiplexer
     /// exists...")` sites depend on, not strict per-connection equality:
     /// the non-last [`remove_connection`](Self::remove_connection) path
     /// drops a connection without dropping its mux, so `mux_count` can
     /// exceed `connection_count` while the peer is still connected.
-    pub async fn conn_mux_invariant_holds(&self, peer_id: &PeerId) -> bool {
-        let conns = self.connection_count(peer_id).await;
-        let muxes = self.mux_count(peer_id).await;
+    pub async fn conn_mux_invariant_holds(&self, session: &Session) -> bool {
+        let conns = self.connection_count(session).await;
+        let muxes = self.mux_count(session).await;
         if conns > 0 { muxes > 0 } else { muxes == 0 }
     }
 
@@ -3515,13 +3543,13 @@ impl<
         self.send_counter.next(peer_id).await
     }
 
-    /// Outgoing-subscription claims held for a peer, or `None` if it has
+    /// Outgoing-subscription claims held for a session, or `None` if it has
     /// none. Test-only observability.
-    pub async fn outgoing_claims(&self, peer_id: &PeerId) -> Option<Set<SedimentreeId>> {
+    pub async fn outgoing_claims(&self, session: &Session) -> Option<Set<SedimentreeId>> {
         self.outgoing_subscriptions
             .lock()
             .await
-            .get(peer_id)
+            .get(session)
             .cloned()
     }
 
@@ -3529,11 +3557,11 @@ impl<
     ///
     /// Test-only: stands in for a claim left behind by an interrupted
     /// teardown.
-    pub async fn insert_outgoing_claim_for_test(&self, peer_id: PeerId, id: SedimentreeId) {
+    pub async fn insert_outgoing_claim_for_test(&self, session: Session, id: SedimentreeId) {
         self.outgoing_subscriptions
             .lock()
             .await
-            .entry(peer_id)
+            .entry(session)
             .or_default()
             .insert(id);
     }
@@ -3826,7 +3854,7 @@ pub trait NodeTasks<
     #[allow(clippy::type_complexity)]
     fn doc_sync_task(
         subduction: Arc<Subduction<'a, Self, E, Conn, Hdl, Metric>>,
-        peer_id: PeerId,
+        session: Session,
         id: SedimentreeId,
         subscribe: bool,
         timeout: CallTimeout,
@@ -3939,15 +3967,15 @@ where
                             )
                             .left_stream()
                         } else {
-                            let peers = node.connected_peer_ids().await;
+                            let sessions = node.connected_sessions().await;
                             // Uncapped rounds must not keep later candidates from starting.
-                            let rounds = peers.into_iter().map(|peer| async move {
+                            let rounds = sessions.into_iter().map(|session| async move {
                                 match node
-                                    .sync_peer(&peer, id, subscribe, CallTimeout::Uncapped)
+                                    .sync_peer(&session, id, subscribe, CallTimeout::Uncapped)
                                     .await
                                 {
                                     Ok(((success, _, _), supplied)) => {
-                                        Ok(success.then_some((peer, supplied)))
+                                        Ok(success.then_some((session.remote(), supplied)))
                                     }
                                     Err(
                                         IoError::ConnCall(_)
@@ -4029,7 +4057,7 @@ where
 
     fn doc_sync_task(
         subduction: Arc<Subduction<'a, Self, E, Conn, Hdl, Metric>>,
-        peer_id: PeerId,
+        session: Session,
         id: SedimentreeId,
         subscribe: bool,
         timeout: CallTimeout,
@@ -4042,7 +4070,7 @@ where
     {
         Async::from_future(async move {
             let result = subduction
-                .sync_with_peer(&peer_id, id, subscribe, timeout)
+                .sync_with_peer(&session, id, subscribe, timeout)
                 .await;
             // Always send a result (even an error) so the driver's drain count
             // stays exact and a per-document failure can't wedge the loop. If
@@ -4171,7 +4199,7 @@ mod tests {
             let removed = node.connections_changed.listen();
             match removal {
                 0 => assert!(node.disconnect(&conn).await?),
-                1 => assert!(node.disconnect_from_peer(&conn.peer_id()).await?),
+                1 => assert!(node.disconnect_from_peer(&conn.session()).await?),
                 2 => node.disconnect_all().await?,
                 _ => assert_eq!(node.remove_connection(&conn).await, Some(true)),
             }
@@ -4204,7 +4232,7 @@ mod tests {
         assert!(futures::poll!(&mut removal).is_pending());
         drop(removal);
         drop(muxes);
-        assert_eq!(node.connection_count(&conn.peer_id()).await, 1);
+        assert_eq!(node.connection_count(&conn.session()).await, 1);
         assert!(
             spawner
                 .0
@@ -4220,7 +4248,7 @@ mod tests {
         assert!(futures::poll!(&mut removal).is_pending());
         drop(removal);
         drop(subscriptions);
-        assert_eq!(node.connection_count(&conn.peer_id()).await, 0);
+        assert_eq!(node.connection_count(&conn.session()).await, 0);
         assert_eq!(node.remove_connection(&conn).await, None);
         let work = core::mem::take(
             &mut *spawner

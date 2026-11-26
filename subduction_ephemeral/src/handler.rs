@@ -25,7 +25,10 @@ use futures::{StreamExt, stream::FuturesUnordered};
 use nonempty::NonEmpty;
 use sedimentree_core::collections::{Map, Set};
 use subduction_core::{
-    authenticated::Authenticated, connection::Connection, handler::Handler, peer::id::PeerId,
+    authenticated::Authenticated,
+    connection::Connection,
+    handler::Handler,
+    peer::{id::PeerId, session::Session},
     spawn::Spawn,
 };
 use thiserror::Error;
@@ -84,11 +87,11 @@ pub struct EphemeralHandler<
     Clk: Clock,
     Sp,
 > {
-    /// Inbound subscriptions: which peers are subscribed to receive ephemeral messages from us.
-    ephemeral_subscriptions: Arc<Mutex<Map<Topic, Set<PeerId>>>>,
+    /// Inbound subscriptions: which sessions are subscribed to receive ephemeral messages from us.
+    ephemeral_subscriptions: Arc<Mutex<Map<Topic, Set<Session>>>>,
     /// Outbound subscriptions: sedimentree IDs we want to receive ephemeral messages for.
     outgoing_subscriptions: Arc<Mutex<Set<Topic>>>,
-    connections: Arc<Mutex<Map<PeerId, NonEmpty<Authenticated<Conn, Async>>>>>,
+    connections: Arc<Mutex<Map<Session, NonEmpty<Authenticated<Conn, Async>>>>>,
     policy: E,
     callback_tx: Sender<EphemeralEvent>,
     max_payload_size: usize,
@@ -112,7 +115,7 @@ pub struct EphemeralHandler<
     /// without invoking `on_peer_disconnect`, so entries evicted via those
     /// paths linger — the same pre-existing gap as ephemeral subscriptions
     /// and the nonce cache. Fix belongs in `subduction_core`'s teardown.
-    inflight_sends: Arc<Mutex<Map<PeerId, Arc<AtomicUsize>>>>,
+    inflight_sends: Arc<Mutex<Map<Session, Arc<AtomicUsize>>>>,
 }
 
 impl<
@@ -158,7 +161,7 @@ impl<Async: FutureForm, Conn: Clone + 'static, E: EphemeralPolicy<Async>, Clk: C
     /// `spawner` runs relay fan-out sends detached from inbound dispatch.
     #[allow(clippy::type_complexity)]
     pub fn new(
-        connections: Arc<Mutex<Map<PeerId, NonEmpty<Authenticated<Conn, Async>>>>>,
+        connections: Arc<Mutex<Map<Session, NonEmpty<Authenticated<Conn, Async>>>>>,
         policy: E,
         config: EphemeralConfig,
         clock: Clk,
@@ -250,50 +253,31 @@ impl<Async: FutureForm, Conn: Clone + 'static, E: EphemeralPolicy<Async>, Clk: C
         }
 
         // Peers subscribed to us (inbound) — we relay to them directly.
-        let mut target_peers: Set<PeerId> = {
+        let mut target_sessions: Set<Session> = {
             let subs = self.ephemeral_subscriptions.lock().await;
             subs.get(&id)
-                .map(|peers| peers.iter().copied().collect())
+                .map(|sessions| sessions.iter().copied().collect())
                 .unwrap_or_default()
         };
 
         // If we have an outgoing subscription for this ID, also send to
-        // all connected peers — they're the relays we subscribed to.
+        // all connected sessions — they're the relays we subscribed to.
         let is_outgoing = self.outgoing_subscriptions.lock().await.contains(&id);
         if is_outgoing {
             let conns = self.connections.lock().await;
-            for peer in conns.keys() {
-                target_peers.insert(*peer);
+            for session in conns.keys() {
+                target_sessions.insert(*session);
             }
         }
 
-        if target_peers.is_empty() {
+        if target_sessions.is_empty() {
             return;
         }
 
-        let authorized_peers = self
-            .policy
-            .filter_authorized_subscribers(id, target_peers.into_iter().collect())
-            .await;
-
-        if authorized_peers.is_empty() {
+        let targets = self.authorized_targets(id, target_sessions).await;
+        if targets.is_empty() {
             return;
         }
-
-        // Collect target connections while holding the lock, then drop it
-        // before awaiting sends to avoid holding the mutex across .await.
-        let targets: Vec<Authenticated<Conn, Async>> = {
-            let conns = self.connections.lock().await;
-            authorized_peers
-                .iter()
-                .flat_map(|peer| {
-                    conns
-                        .get(peer)
-                        .into_iter()
-                        .flat_map(|peer_conns| peer_conns.iter().cloned())
-                })
-                .collect()
-        };
 
         // Fan out concurrently so one backpressured peer can't head-of-line
         // block delivery to the others. Peers already at their in-flight cap
@@ -351,11 +335,39 @@ impl<Async: FutureForm, Conn: Clone + 'static, E: EphemeralPolicy<Async>, Clk: C
         self.send_to_all_peers(&msg).await;
     }
 
-    /// Send current outgoing ephemeral subscriptions to a specific peer.
+    /// The connections of the `sessions` whose remote peer the policy allows
+    /// to receive ephemeral messages for `id`. The policy decides by the
+    /// remote peer; every session of an allowed peer is a target.
+    async fn authorized_targets(
+        &self,
+        id: Topic,
+        sessions: Set<Session>,
+    ) -> Vec<Authenticated<Conn, Async>> {
+        let peers: Set<PeerId> = sessions.iter().map(Session::remote).collect();
+        let authorized = self
+            .policy
+            .filter_authorized_subscribers(id, peers.into_iter().collect())
+            .await;
+        // Collect target connections while holding the lock, then drop it
+        // before awaiting sends to avoid holding the mutex across .await.
+        let conns = self.connections.lock().await;
+        sessions
+            .iter()
+            .filter(|session| authorized.contains(&session.remote()))
+            .flat_map(|session| {
+                conns
+                    .get(session)
+                    .into_iter()
+                    .flat_map(|session_conns| session_conns.iter().cloned())
+            })
+            .collect()
+    }
+
+    /// Send current outgoing ephemeral subscriptions to a specific session.
     ///
-    /// Call this after a new peer connects so they know to send us
+    /// Call this after a new session connects so its remote knows to send us
     /// ephemeral messages for our subscribed topics.
-    pub async fn subscribe_peer(&self, peer_id: PeerId)
+    pub async fn subscribe_peer(&self, session: Session)
     where
         Conn: Connection<Async, EphemeralMessage>,
     {
@@ -373,7 +385,7 @@ impl<Async: FutureForm, Conn: Clone + 'static, E: EphemeralPolicy<Async>, Clk: C
         let targets: Vec<Authenticated<Conn, Async>> = {
             let conns = self.connections.lock().await;
             conns
-                .get(&peer_id)
+                .get(&session)
                 .into_iter()
                 .flat_map(|peer_conns| peer_conns.iter().cloned())
                 .collect()
@@ -471,19 +483,29 @@ impl<Async: FutureForm, Conn, E, Clk, Sp> Handler<Async, Conn>
         })
     }
 
-    fn on_peer_disconnect(&self, peer: PeerId) -> Async::Future<'_, ()> {
+    fn on_peer_disconnect(&self, session: Session) -> Async::Future<'_, ()> {
         Async::from_future(async move {
             let mut subs = self.ephemeral_subscriptions.lock().await;
-            subs.retain(|_id, peers| {
-                peers.remove(&peer);
-                !peers.is_empty()
+            subs.retain(|_id, sessions| {
+                sessions.remove(&session);
+                !sessions.is_empty()
             });
 
-            self.nonce_cache.lock().await.remove_peer(peer);
-            self.inflight_sends.lock().await.remove(&peer);
+            // The nonce cache is per remote peer: another session of the same
+            // peer shares its replay window, so keep it while one is open.
+            let peer_still_connected = self
+                .connections
+                .lock()
+                .await
+                .keys()
+                .any(|open| open.remote() == session.remote());
+            if !peer_still_connected {
+                self.nonce_cache.lock().await.remove_peer(session.remote());
+            }
+            self.inflight_sends.lock().await.remove(&session);
 
             debug!(
-                peer = %peer,
+                %session,
                 "cleaned ephemeral subscriptions, nonce cache, and in-flight accounting on disconnect"
             );
         })
@@ -539,7 +561,7 @@ impl<
             targets
                 .into_iter()
                 .filter_map(|conn| {
-                    let peer = conn.peer_id();
+                    let peer = conn.session();
                     let counter = inflight
                         .entry(peer)
                         .or_insert_with(|| Arc::new(AtomicUsize::new(0)));
@@ -726,42 +748,24 @@ impl<
         // 7. Fan out to other subscribers, excluding:
         //    - the relay that forwarded the message to us
         //    - the originator (they already have it — they wrote it)
-        let subscriber_peers: Vec<PeerId> = {
+        let subscriber_sessions: Set<Session> = {
             let subs = self.ephemeral_subscriptions.lock().await;
             subs.get(&id)
-                .map(|peers| {
-                    peers
+                .map(|sessions| {
+                    sessions
                         .iter()
                         .copied()
-                        .filter(|p| *p != relay && *p != sender)
+                        .filter(|s| s.remote() != relay && s.remote() != sender)
                         .collect()
                 })
                 .unwrap_or_default()
         };
 
-        if subscriber_peers.is_empty() {
+        if subscriber_sessions.is_empty() {
             return None;
         }
 
-        let authorized_peers = self
-            .policy
-            .filter_authorized_subscribers(id, subscriber_peers)
-            .await;
-
-        // Collect target connections while holding the lock, then drop it
-        // before awaiting sends to avoid holding the mutex across .await.
-        let targets: Vec<Authenticated<Conn, Async>> = {
-            let conns = self.connections.lock().await;
-            authorized_peers
-                .iter()
-                .flat_map(|peer| {
-                    conns
-                        .get(peer)
-                        .into_iter()
-                        .flat_map(|peer_conns| peer_conns.iter().cloned())
-                })
-                .collect()
-        };
+        let targets = self.authorized_targets(id, subscriber_sessions).await;
 
         // Forward the original signed message as-is (preserving sender +
         // signature). The returned fan-out is spawned by `handle` OFF this
@@ -798,7 +802,7 @@ impl<
         if !authorized.is_empty() {
             let mut subs = self.ephemeral_subscriptions.lock().await;
             for topic in &authorized {
-                subs.entry(*topic).or_default().insert(peer);
+                subs.entry(*topic).or_default().insert(conn.session());
             }
         }
 
@@ -816,12 +820,12 @@ impl<
 
     /// Handle an unsubscribe request from a peer.
     async fn recv_unsubscribe(&self, conn: &Authenticated<Conn, Async>, topics: NonEmpty<Topic>) {
-        let peer = conn.peer_id();
+        let session = conn.session();
         let mut subs = self.ephemeral_subscriptions.lock().await;
 
         for topic in &topics {
             if let Some(peers) = subs.get_mut(topic) {
-                peers.remove(&peer);
+                peers.remove(&session);
                 if peers.is_empty() {
                     subs.remove(topic);
                 }

@@ -7,6 +7,7 @@
 #![allow(clippy::panic)]
 
 use std::{sync::Arc, time::Duration};
+use subduction_core::peer::session::{Session, TEST_LOCAL};
 
 use future_form::Sendable;
 use sedimentree_core::{depth::CountLeadingZeroBytes, id::SedimentreeId};
@@ -67,24 +68,26 @@ async fn stale_claims_cleared_on_peer_arrival() -> TestResult {
     let tree = SedimentreeId::new([42u8; 32]);
 
     // A stale claim for an absent peer: what an interrupted teardown leaves.
-    node.insert_outgoing_claim_for_test(peer, tree).await;
+    node.insert_outgoing_claim_for_test(Session::new(peer, TEST_LOCAL), tree)
+        .await;
 
     // The peer arrives (absent → present): the stale claim must be gone.
     let (conn1, _remote1) = make_conn(peer);
     node.add_connection(conn1.clone()).await?;
     assert_eq!(
-        node.outgoing_claims(&peer).await,
+        node.outgoing_claims(&Session::new(peer, TEST_LOCAL)).await,
         None,
         "claims from a previous connection era must be invalidated on arrival"
     );
 
     // A claim made while connected survives further connections from the
     // same peer (present → present is not a new era).
-    node.insert_outgoing_claim_for_test(peer, tree).await;
+    node.insert_outgoing_claim_for_test(Session::new(peer, TEST_LOCAL), tree)
+        .await;
     let (conn2, _remote2) = make_conn(peer);
     node.add_connection(conn2.clone()).await?;
     assert!(
-        node.outgoing_claims(&peer)
+        node.outgoing_claims(&Session::new(peer, TEST_LOCAL))
             .await
             .is_some_and(|claims| claims.contains(&tree)),
         "claims made in the current connection era must survive"
@@ -92,8 +95,10 @@ async fn stale_claims_cleared_on_peer_arrival() -> TestResult {
 
     // Full disconnect then reconnect: the next era starts clean even if a
     // claim were somehow left behind.
-    node.disconnect_from_peer(&peer).await?;
-    node.insert_outgoing_claim_for_test(peer, tree).await;
+    node.disconnect_from_peer(&Session::new(peer, TEST_LOCAL))
+        .await?;
+    node.insert_outgoing_claim_for_test(Session::new(peer, TEST_LOCAL), tree)
+        .await;
     // Let disconnect processing settle so the arrival below is a clean
     // absent → present transition.
     tokio::time::sleep(Duration::from_millis(10)).await;
@@ -101,7 +106,7 @@ async fn stale_claims_cleared_on_peer_arrival() -> TestResult {
     let (conn3, _remote3) = make_conn(peer);
     node.add_connection(conn3).await?;
     assert_eq!(
-        node.outgoing_claims(&peer).await,
+        node.outgoing_claims(&Session::new(peer, TEST_LOCAL)).await,
         None,
         "reconnect after full teardown must start a fresh claim era"
     );

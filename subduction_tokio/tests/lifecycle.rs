@@ -18,7 +18,10 @@ use std::{
 };
 use subduction_core::{
     authenticated::{Authenticated, Direction},
-    peer::id::PeerId,
+    peer::{
+        id::PeerId,
+        session::{Session, TEST_LOCAL},
+    },
     policy::open::OpenPolicy,
     storage::memory::MemoryStorage,
     transport::Transport,
@@ -233,7 +236,12 @@ async fn heterogeneous_transports_share_one_node_and_sync() {
         .unwrap();
     let result = b
         .handle()
-        .sync_with_peer(peer(1), id, false, CallTimeout::Default)
+        .sync_with_peer(
+            Session::new(peer(1), TEST_LOCAL),
+            id,
+            false,
+            CallTimeout::Default,
+        )
         .await
         .unwrap();
     assert!(result.success);
@@ -242,7 +250,12 @@ async fn heterogeneous_transports_share_one_node_and_sync() {
     assert!(matches!(a_c.status(), ConnectionStatus::Connected { .. }));
     assert!(
         c.handle()
-            .sync_with_peer(peer(1), id, false, CallTimeout::Default)
+            .sync_with_peer(
+                Session::new(peer(1), TEST_LOCAL),
+                id,
+                false,
+                CallTimeout::Default
+            )
             .await
             .unwrap()
             .success

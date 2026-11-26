@@ -64,7 +64,7 @@ use subduction_core::{
     handler::sync::SyncHandler,
     handshake::{self, Handshake, audience::Audience},
     nonce_cache::NonceCache,
-    peer::id::PeerId,
+    peer::{id::PeerId, session::Session},
     policy::open::OpenPolicy,
     storage::memory::MemoryStorage,
     subduction::{Subduction, builder::SubductionBuilder},
@@ -1046,7 +1046,12 @@ fn bench_incremental_sync(c: &mut Criterion) {
             // enumerate the empty local store and do nothing.
             assert_sync(
                 client
-                    .sync_with_peer(&server_peer_id, sed_id, true, TIMEOUT)
+                    .sync_with_peer(
+                        &Session::new(server_peer_id, client.peer_id()),
+                        sed_id,
+                        true,
+                        TIMEOUT,
+                    )
                     .await,
             );
 
@@ -1130,8 +1135,13 @@ fn bench_concurrent_clients(c: &mut Criterion) {
                                 let c = client.inner();
                                 handles.push(tokio::spawn(async move {
                                     assert_sync(
-                                        c.sync_with_peer(&server_peer_id, sed_id, true, TIMEOUT)
-                                            .await,
+                                        c.sync_with_peer(
+                                            &Session::new(server_peer_id, c.peer_id()),
+                                            sed_id,
+                                            true,
+                                            TIMEOUT,
+                                        )
+                                        .await,
                                     );
                                 }));
                             }
@@ -1198,8 +1208,13 @@ fn bench_concurrent_clients_fs(c: &mut Criterion) {
                                 let c = client.inner();
                                 handles.push(tokio::spawn(async move {
                                     assert_sync(
-                                        c.sync_with_peer(&server_peer_id, sed_id, true, TIMEOUT)
-                                            .await,
+                                        c.sync_with_peer(
+                                            &Session::new(server_peer_id, c.peer_id()),
+                                            sed_id,
+                                            true,
+                                            TIMEOUT,
+                                        )
+                                        .await,
                                     );
                                 }));
                             }

@@ -14,6 +14,7 @@
 )]
 
 use std::{sync::Arc, time::Duration};
+use subduction_core::peer::session::Session;
 
 use async_lock::Mutex;
 use future_form::Sendable;
@@ -44,7 +45,7 @@ type EphConn = ChannelMockConnection<EphemeralMessage>;
 type EphAuth = Authenticated<EphConn, Sendable>;
 type EphHandle =
     subduction_core::connection::test_utils::ChannelMockConnectionHandle<EphemeralMessage>;
-type Connections = Arc<Mutex<Map<PeerId, NonEmpty<EphAuth>>>>;
+type Connections = Arc<Mutex<Map<Session, NonEmpty<EphAuth>>>>;
 
 const TEST_CLOCK_SECS: TimestampSeconds = TimestampSeconds::new(1_000);
 
@@ -74,7 +75,7 @@ async fn register_peer(connections: &Connections, peer_id: PeerId) -> (EphAuth, 
     connections
         .lock()
         .await
-        .insert(peer_id, NonEmpty::new(auth.clone()));
+        .insert(auth.session(), NonEmpty::new(auth.clone()));
     (auth, handle)
 }
 

@@ -12,6 +12,7 @@
 //! ```
 
 use std::{collections::BTreeSet, time::Duration};
+use subduction_core::peer::session::{Session, TEST_LOCAL};
 
 use sedimentree_core::id::SedimentreeId;
 use subduction_core::{
@@ -38,8 +39,13 @@ async fn wedged_subscriber_does_not_block_relay_sync() -> TestResult {
     // A subscribes to X on R while nobody has X yet, so R records A as a
     // subscriber (and propagates upstream, which finds nothing).
     let x = SedimentreeId::new([9u8; 32]);
-    a.sync_with_peer(&r_peer, x, true, SYNC_TIMEOUT).await?;
-    assert!(r.get_subscribers(x).await.contains(&a_peer));
+    a.sync_with_peer(&Session::new(r_peer, TEST_LOCAL), x, true, SYNC_TIMEOUT)
+        .await?;
+    assert!(
+        r.get_subscribers(x)
+            .await
+            .contains(&Session::new(a_peer, TEST_LOCAL))
+    );
 
     // R's sends to A now park forever: A is byte-connected but wedged.
     r_to_a.pause();
@@ -48,7 +54,11 @@ async fn wedged_subscriber_does_not_block_relay_sync() -> TestResult {
     // that push must not hold R's sync round open.
     b.store_commit(x, make_head(1), BTreeSet::new(), make_blob(1))
         .await?;
-    let round = tokio::time::timeout(BOUND, r.sync_with_peer(&b_peer, x, true, SYNC_TIMEOUT)).await;
+    let round = tokio::time::timeout(
+        BOUND,
+        r.sync_with_peer(&Session::new(b_peer, TEST_LOCAL), x, true, SYNC_TIMEOUT),
+    )
+    .await;
     assert!(
         round.is_ok(),
         "sync_with_peer did not return within {BOUND:?}; a parked subscriber send is blocking it"
@@ -73,7 +83,8 @@ async fn wedged_subscriber_does_not_block_sync_with_all_peers() -> TestResult {
     tokio::time::sleep(Duration::from_millis(20)).await;
 
     let x = SedimentreeId::new([10u8; 32]);
-    a.sync_with_peer(&r_peer, x, true, SYNC_TIMEOUT).await?;
+    a.sync_with_peer(&Session::new(r_peer, TEST_LOCAL), x, true, SYNC_TIMEOUT)
+        .await?;
     r_to_a.pause();
 
     b.store_commit(x, make_head(1), BTreeSet::new(), make_blob(1))

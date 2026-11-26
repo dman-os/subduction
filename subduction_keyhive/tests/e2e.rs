@@ -23,7 +23,7 @@ use sedimentree_core::{blob::Blob, id::SedimentreeId, loose_commit::id::CommitId
 use subduction_core::{
     authenticated::{Authenticated, Direction},
     connection::test_utils::ChannelTransport,
-    peer::id::PeerId,
+    peer::{id::PeerId, session::Session},
     subduction::error::AddConnectionError,
     timeout::call::CallTimeout,
     transport::message::MessageTransport,
@@ -271,9 +271,10 @@ async fn invalid_identities_are_refused_at_connect() -> TestResult {
     let server = TestNode::new(30).await?;
     let (transport, _other_end) = ChannelTransport::pair();
     let refused = server
-        .attach(Authenticated::new_for_test(
+        .attach(Authenticated::new_for_test_as(
             MessageTransport::new(transport),
             PeerId::new(SMALL_ORDER_POINT),
+            server.peer_id(),
             Direction::Accepted,
         ))
         .await;
@@ -419,7 +420,12 @@ impl TestNodeExt for TestNode {
     /// Sync one tree with `peer`, both ways.
     async fn sync_tree(&self, peer: &TestNode, id: SedimentreeId) -> TestResult {
         self.subduction
-            .sync_with_peer(&peer.peer_id(), id, false, SYNC_TIMEOUT)
+            .sync_with_peer(
+                &Session::new(peer.peer_id(), self.peer_id()),
+                id,
+                false,
+                SYNC_TIMEOUT,
+            )
             .await?;
         Ok(())
     }

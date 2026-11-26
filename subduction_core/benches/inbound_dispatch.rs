@@ -59,6 +59,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
+use subduction_core::peer::session::{Session, TEST_LOCAL};
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use future_form::Sendable;
@@ -278,8 +279,13 @@ fn one_cold_start(
                     .map(|doc| {
                         let a = Arc::clone(&a);
                         async move {
-                            a.sync_with_peer(&b_peer, doc_id(doc), true, SYNC_TIMEOUT)
-                                .await
+                            a.sync_with_peer(
+                                &Session::new(b_peer, TEST_LOCAL),
+                                doc_id(doc),
+                                true,
+                                SYNC_TIMEOUT,
+                            )
+                            .await
                         }
                     })
                     .collect();
@@ -287,7 +293,8 @@ fn one_cold_start(
                 while pending.next().await.is_some() {}
             }
             Driver::SpawnedFullSync => {
-                a.full_sync_with_peer(&b_peer, true, SYNC_TIMEOUT).await;
+                a.full_sync_with_peer(&Session::new(b_peer, TEST_LOCAL), true, SYNC_TIMEOUT)
+                    .await;
             }
         }
 
@@ -363,7 +370,8 @@ fn one_server_fan_in(
             .map(|c| {
                 let c = Arc::clone(c);
                 async move {
-                    c.full_sync_with_peer(&b_peer, true, SYNC_TIMEOUT).await;
+                    c.full_sync_with_peer(&Session::new(b_peer, TEST_LOCAL), true, SYNC_TIMEOUT)
+                        .await;
                 }
             })
             .collect();

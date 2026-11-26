@@ -2,7 +2,7 @@
 
 use alloc::vec::Vec;
 
-use subduction_core::handshake::AuthenticateError;
+use subduction_core::{handshake::AuthenticateError, peer::id::PeerId};
 use thiserror::Error;
 
 /// Outbound channel closed -- no more messages can be sent.
@@ -77,9 +77,30 @@ pub enum RunError {
     ChanSend(Box<async_channel::SendError<Vec<u8>>>),
 }
 
+/// A session declared as the node principal was asked to sign with a key that
+/// is not the endpoint's identity.
+///
+/// The endpoint's TLS key is the node's transport identity, so a handshake
+/// signed by any other key is not the node's: it is a shared principal, and
+/// must be declared as one with [`SessionPrincipal::Shared`].
+///
+/// [`SessionPrincipal::Shared`]: crate::SessionPrincipal::Shared
+#[derive(Debug, Clone, Copy, Error)]
+#[error("node principal {principal} is not the endpoint identity {endpoint}")]
+pub struct PrincipalNotEndpoint {
+    /// The key the handshake would have been signed with.
+    pub principal: PeerId,
+    /// The endpoint's identity.
+    pub endpoint: PeerId,
+}
+
 /// Errors when connecting to a peer.
 #[derive(Debug, Error)]
 pub enum ConnectError {
+    /// The session was declared as the node principal but is signed by another key.
+    #[error(transparent)]
+    PrincipalNotEndpoint(#[from] PrincipalNotEndpoint),
+
     /// Failed to establish the QUIC connection.
     #[error("QUIC connect error: {0}")]
     Connect(#[from] iroh::endpoint::ConnectError),
@@ -100,6 +121,10 @@ pub enum ConnectError {
 /// Errors when accepting a connection.
 #[derive(Debug, Error)]
 pub enum AcceptError {
+    /// The session was declared as the node principal but is signed by another key.
+    #[error(transparent)]
+    PrincipalNotEndpoint(#[from] PrincipalNotEndpoint),
+
     /// No incoming connection (endpoint shutting down).
     #[error("no incoming connection")]
     NoIncoming,

@@ -58,11 +58,11 @@ use subduction_core::{
     minimized_tree_store::memory::MemoryMinimizedTreeStore,
     multiplexer::DEFAULT_ROUNDTRIP_TIMEOUT,
     nonce_cache::NonceCache,
-    peer::{counter::PeerCounter, id::PeerId},
+    peer::{counter::PeerCounter, id::PeerId, session::Session},
     spawn::Spawn,
     subduction::{
         StorageTasks, Subduction,
-        per_peer_sync::{PeerSyncEntry, PerPeerSync},
+        per_session_sync::{PeerSyncEntry, PerSessionSync},
         request::FragmentRequested,
     },
     timeout::call::CallTimeout,
@@ -92,7 +92,7 @@ pub type NodeConnection = MessageTransport<ManagedTransport>;
 /// Core per-peer result, without a JS value wrapper.
 pub type PeerSyncResult = PeerSyncEntry<NodeConnection, Local, JsTransportError>;
 /// Core broadcast result, without a JS map wrapper.
-pub type PeerSyncResults = PerPeerSync<NodeConnection, Local, JsTransportError>;
+pub type PeerSyncResults = PerSessionSync<NodeConnection, Local, JsTransportError>;
 /// The effects every Wasm node is built from.
 pub(crate) type WasmEffects =
     Config<JsStorage, JsPolicy, JsSigner, JsTimeout, WasmSpawn, WasmTreeStore>;
@@ -268,15 +268,15 @@ impl Node {
         authenticated: AuthenticatedTransport,
         lease: &TransportLease,
     ) -> Result<bool, WasmAddConnectionError> {
-        let peer = authenticated.peer_id();
+        let session = authenticated.session();
         let managed = authenticated.map(|_| MessageTransport::new(lease.transport()));
         let fresh = self.core.add_connection(managed).await?;
         if fresh {
-            self.ephemeral_handler.subscribe_peer(peer).await;
+            self.ephemeral_handler.subscribe_peer(session).await;
             if let Some(keyhive) = &self.keyhive
-                && let Err(e) = keyhive.add_peer(peer).await
+                && let Err(e) = keyhive.add_peer(session).await
             {
-                tracing::warn!(%peer, "keyhive could not register the peer: {e}");
+                tracing::warn!(%session, "keyhive could not register the session: {e}");
             }
         }
         Ok(fresh)
@@ -495,11 +495,21 @@ impl Node {
             .run::<_, WasmDisconnectionError>(async { Ok(self.core.disconnect_all().await?) })
             .await
     }
+    /// The session with `peer` as this node's own principal. The JavaScript
+    /// API names a peer by its id and opens every connection with the node's
+    /// signer, so its peers are always reached under that principal.
+    fn node_session(&self, peer: PeerId) -> Session {
+        Session::new(peer, self.core.peer_id())
+    }
+
     /// Disconnect all connections to a peer.
     pub async fn disconnect_from_peer(&self, peer: &PeerId) -> Result<bool, JsValue> {
         self.runtime
             .run::<_, WasmDisconnectionError>(async {
-                Ok(self.core.disconnect_from_peer(peer).await?)
+                Ok(self
+                    .core
+                    .disconnect_from_peer(&self.node_session(*peer))
+                    .await?)
             })
             .await
     }
@@ -631,7 +641,12 @@ impl Node {
             .run::<_, WasmIoError>(async {
                 Ok(self
                     .core
-                    .sync_with_peer(peer, *id, subscribe, call_timeout(timeout))
+                    .sync_with_peer(
+                        &self.node_session(*peer),
+                        *id,
+                        subscribe,
+                        call_timeout(timeout),
+                    )
                     .await?)
             })
             .await
@@ -663,7 +678,11 @@ impl Node {
             .run_value(async {
                 let (success, stats, errors, io_errors) = self
                     .core
-                    .full_sync_with_peer(peer, subscribe.unwrap_or(true), call_timeout(timeout))
+                    .full_sync_with_peer(
+                        &self.node_session(*peer),
+                        subscribe.unwrap_or(true),
+                        call_timeout(timeout),
+                    )
                     .await;
                 for (id, err) in &io_errors {
                     tracing::error!(
@@ -745,7 +764,7 @@ impl Node {
                 use subduction_core::connection::Connection;
                 let conn = self
                     .core
-                    .get_connection(peer)
+                    .get_connection(&self.node_session(*peer))
                     .await
                     .ok_or_else(|| JsValue::from_str("no connection for peer"))?;
                 conn.send(&WireMessage::Keyhive(KeyhiveMessage::new(payload.to_vec())))

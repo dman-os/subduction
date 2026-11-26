@@ -18,7 +18,7 @@ use subduction_core::{
         message::{SyncMessage, TryAsBatchSyncResponse, TryAsSubscribeRequest},
     },
     handler::Handler,
-    peer::id::PeerId,
+    peer::{id::PeerId, session::Session},
     remote_heads::{RemoteHeads, RemoteHeadsNotifier},
     storage::traits::Storage,
     subduction::error::{IoError, ListenError},
@@ -209,10 +209,10 @@ where
         })
     }
 
-    fn on_peer_disconnect(&self, peer: PeerId) -> Async::Future<'_, ()> {
+    fn on_peer_disconnect(&self, session: Session) -> Async::Future<'_, ()> {
         Async::from_future(async move {
-            self.sync.on_peer_disconnect(peer).await;
-            self.ephemeral.on_peer_disconnect(peer).await;
+            self.sync.on_peer_disconnect(session).await;
+            self.ephemeral.on_peer_disconnect(session).await;
         })
     }
 }

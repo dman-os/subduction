@@ -22,7 +22,7 @@ use std::{
 };
 use subduction_core::{
     handshake::audience::Audience,
-    peer::id::PeerId,
+    peer::{id::PeerId, session::Session},
     policy::{connection::ConnectionPolicy, storage::StoragePolicy},
     storage::traits::Storage,
     timeout::call::CallTimeout,
@@ -446,7 +446,8 @@ impl NodeHandle {
         self.operation(move |core| Box::pin(async move { core.ids().await }))
             .await
     }
-    /// Sync with the existing core completion semantics. `subscribe` establishes
+    /// Sync over the named session with the existing core completion semantics.
+    /// `subscribe` establishes
     /// subscriptions for this connection era; callers must restore them after reconnect
     /// unless an active `load_and_watch` stream is following the document.
     ///
@@ -454,17 +455,18 @@ impl NodeHandle {
     /// Returns lifecycle or core ingestion errors. Roundtrip errors are in the report.
     pub async fn sync_with_peer(
         &self,
-        peer: PeerId,
+        session: Session,
         id: SedimentreeId,
         subscribe: bool,
         timeout: CallTimeout,
     ) -> Result<PeerSyncReport, Error> {
         self.operation(move |core| {
-            Box::pin(async move { core.sync(peer, id, subscribe, timeout).await })
+            Box::pin(async move { core.sync(session, id, subscribe, timeout).await })
         })
         .await
     }
-    /// Close every logical connection bound to this peer, including backoff states.
+    /// Close every logical connection bound to this peer, whichever local
+    /// principal it authenticated as, including backoff states.
     ///
     /// # Errors
     /// Returns a retained connection failure or cleanup error after all selected
@@ -613,6 +615,7 @@ async fn start_connection(options: Connect) -> Result<ConnectionHandle, Error> {
                 Audience::Known(peer) => Some(peer),
                 Audience::Discover(_) => None,
             }),
+            session: Mutex::new(None),
             status: watch::channel(ConnectionStatus::Connecting { generation: 0 }).0,
         });
         admission.connections.insert(id, logical.clone());
@@ -691,7 +694,8 @@ async fn run_connection(
                     "connector returned a different attempt",
                 ));
             }
-            let peer = established.transport.peer_id();
+            let session = established.transport.session();
+            let peer = session.remote();
             if let Audience::Known(expected) = audience
                 && peer != expected
             {
@@ -711,7 +715,7 @@ async fn run_connection(
             let cleanup_connection = connection.clone();
             scope.on_cleanup(async move { cleanup_core.remove(cleanup_connection).await })?;
             core.add(connection).await?;
-            Ok(peer)
+            Ok(session)
         };
         let mut deadline = inner.config.connect_timeout;
         if let (Some(start), Some(policy)) = (outage, options.retry.as_ref()) {
@@ -729,15 +733,25 @@ async fn run_connection(
         };
         let mut connected_at = None;
         let failure = match result {
-            Ok(peer) => {
+            Ok(session) => {
                 *logical
                     .peer
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(peer);
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(session.remote());
+                *logical
+                    .session
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(session);
                 if !options.rediscover {
-                    audience = Audience::Known(peer);
+                    audience = Audience::Known(session.remote());
                 }
-                inner.publish(&logical, ConnectionStatus::Connected { peer, generation });
+                inner.publish(
+                    &logical,
+                    ConnectionStatus::Connected {
+                        session,
+                        generation,
+                    },
+                );
                 connected_at = Some(Instant::now());
                 if let Some(tx) = initial.take()
                     && tx.send(Ok(())).is_err()

@@ -21,6 +21,7 @@ use std::{
     },
     time::Duration,
 };
+use subduction_core::peer::session::{Session, TEST_LOCAL};
 
 use future_form::Sendable;
 use sedimentree_core::{blob::BlobMeta, id::SedimentreeId, loose_commit::LooseCommit};
@@ -138,7 +139,12 @@ async fn subscribe_is_not_forwarded_to_other_downstreams() -> TestResult {
 
     b.inbound_tx.send(subscribe_request(b_peer, x)).await?;
     assert!(
-        wait_until(|| async { hub.get_subscribers(x).await.contains(&b_peer) }).await,
+        wait_until(|| async {
+            hub.get_subscribers(x)
+                .await
+                .contains(&Session::new(b_peer, TEST_LOCAL))
+        })
+        .await,
         "hub should record B's subscription"
     );
 
@@ -146,7 +152,7 @@ async fn subscribe_is_not_forwarded_to_other_downstreams() -> TestResult {
     // propagation pass ran and chose its peers.
     assert!(
         wait_until(|| async {
-            hub.outgoing_claims(&up_peer)
+            hub.outgoing_claims(&Session::new(up_peer, TEST_LOCAL))
                 .await
                 .is_some_and(|claims| claims.contains(&x))
         })
@@ -161,7 +167,9 @@ async fn subscribe_is_not_forwarded_to_other_downstreams() -> TestResult {
     );
     assert_eq!(
         hub.get_subscribers(x).await,
-        BTreeSet::from([b_peer, up_peer]).into_iter().collect(),
+        BTreeSet::from([b_peer, up_peer].map(|p| Session::new(p, TEST_LOCAL)))
+            .into_iter()
+            .collect(),
         "B subscribed, and the upstream has a mutual subscription"
     );
     Ok(())
@@ -186,7 +194,12 @@ async fn subscribe_is_forwarded_to_dialed_upstream() -> TestResult {
         "hub should forward B's subscribe to its dialed upstream"
     );
     assert!(
-        wait_until(|| async { hub.get_subscribers(x).await.contains(&up_peer) }).await,
+        wait_until(|| async {
+            hub.get_subscribers(x)
+                .await
+                .contains(&Session::new(up_peer, TEST_LOCAL))
+        })
+        .await,
         "mutual subscription: the upstream should now receive the hub's pushes for X"
     );
     Ok(())
@@ -235,7 +248,7 @@ async fn client_does_not_receive_documents_it_never_asked_for() -> TestResult {
 
     assert_eq!(
         s.get_subscribers(x).await.into_iter().collect::<Vec<_>>(),
-        vec![b_peer],
+        vec![Session::new(b_peer, TEST_LOCAL)],
         "only B subscribed to X on the server"
     );
     assert!(
@@ -259,7 +272,8 @@ async fn client_does_not_receive_documents_it_never_asked_for() -> TestResult {
     assert!(!has(&a, x).await, "A must not have X after B's later edit");
 
     // Positive control.
-    a.sync_with_peer(&s_peer, x, true, SYNC_TIMEOUT).await?;
+    a.sync_with_peer(&Session::new(s_peer, TEST_LOCAL), x, true, SYNC_TIMEOUT)
+        .await?;
     assert!(
         wait_until(|| async { a.get_commits(x).await.map(|c| c.len()) == Some(2) }).await,
         "once A asks for X it receives it"
@@ -288,7 +302,9 @@ async fn relay_forwards_data_it_pulled_from_upstream() -> TestResult {
         .await?;
 
     // The initial response must include X, not complete empty and push later.
-    let (success, _, _) = a.sync_with_peer(&r_peer, x, true, SYNC_TIMEOUT).await?;
+    let (success, _, _) = a
+        .sync_with_peer(&Session::new(r_peer, TEST_LOCAL), x, true, SYNC_TIMEOUT)
+        .await?;
     assert!(success);
     assert!(has(&r, x).await, "R should pull X from B");
     assert!(
@@ -393,7 +409,9 @@ async fn relay_forwards_fragments_it_pulled_from_upstream() -> TestResult {
     )
     .await?;
 
-    let (success, _, _) = a.sync_with_peer(&r_peer, x, true, SYNC_TIMEOUT).await?;
+    let (success, _, _) = a
+        .sync_with_peer(&Session::new(r_peer, TEST_LOCAL), x, true, SYNC_TIMEOUT)
+        .await?;
     assert!(success);
     assert!(
         has_fragment(&r, x).await,
@@ -463,7 +481,8 @@ async fn already_known_items_are_not_re_pushed() -> TestResult {
     assert_eq!(pushes(0xE1).await, 1, "first pull pushes X to B once");
 
     // Second pull: the hub asks U again and gets the same X back.
-    hub.sync_with_peer(&up_peer, x, false, SYNC_TIMEOUT).await?;
+    hub.sync_with_peer(&Session::new(up_peer, TEST_LOCAL), x, false, SYNC_TIMEOUT)
+        .await?;
     assert_eq!(
         pushes(0xE2).await,
         0,

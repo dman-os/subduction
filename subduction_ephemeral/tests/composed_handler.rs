@@ -9,6 +9,7 @@
 use future_form::Sendable;
 use nonempty::NonEmpty;
 use std::collections::BTreeSet;
+use subduction_core::peer::session::{Session, TEST_LOCAL};
 
 use sedimentree_core::{
     codec::{
@@ -167,10 +168,10 @@ impl Handler<Sendable, TestConn> for TrackingSyncHandler {
         })
     }
 
-    fn on_peer_disconnect(&self, peer: PeerId) -> futures::future::BoxFuture<'_, ()> {
+    fn on_peer_disconnect(&self, session: Session) -> futures::future::BoxFuture<'_, ()> {
         Box::pin(async move {
             self.disconnected
-                .send(peer)
+                .send(session.remote())
                 .await
                 .expect("tracking channel open");
         })
@@ -202,10 +203,10 @@ impl Handler<Sendable, TestConn> for TrackingEphemeralHandler {
         })
     }
 
-    fn on_peer_disconnect(&self, peer: PeerId) -> futures::future::BoxFuture<'_, ()> {
+    fn on_peer_disconnect(&self, session: Session) -> futures::future::BoxFuture<'_, ()> {
         Box::pin(async move {
             self.disconnected
-                .send(peer)
+                .send(session.remote())
                 .await
                 .expect("tracking channel open");
         })
@@ -403,7 +404,8 @@ async fn on_peer_disconnect_calls_both_handlers() {
     let (composed, _, _, sync_disc_rx, eph_disc_rx) = make_handler();
     let peer_id = peer(7);
 
-    Handler::<Sendable, TestConn>::on_peer_disconnect(&composed, peer_id).await;
+    Handler::<Sendable, TestConn>::on_peer_disconnect(&composed, Session::new(peer_id, TEST_LOCAL))
+        .await;
 
     let sync_peer = sync_disc_rx
         .try_recv()

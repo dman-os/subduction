@@ -12,6 +12,7 @@
 #![allow(clippy::expect_used, clippy::indexing_slicing)]
 
 use std::{sync::Arc, time::Duration};
+use subduction_core::peer::session::{Session, TEST_LOCAL};
 
 use future_form::Sendable;
 use sedimentree_core::{depth::CountLeadingZeroBytes, id::SedimentreeId};
@@ -135,7 +136,7 @@ async fn call_timeout_default_uses_builder_configured_deadline() -> TestResult {
 
     let b_peer = PeerId::from(b_signer.verifying_key());
     let (success, _stats, conn_errs) = per_peer
-        .get(&b_peer)
+        .get(&Session::new(b_peer, TEST_LOCAL))
         .expect("wedged peer must be present in the result map");
     assert!(!success, "wedged peer should not have succeeded");
     assert!(
@@ -197,7 +198,7 @@ async fn call_timeout_covers_wedged_send_phase() -> TestResult {
 
     let b_peer = PeerId::from(b_signer.verifying_key());
     let (success, _stats, conn_errs) = per_peer
-        .get(&b_peer)
+        .get(&Session::new(b_peer, TEST_LOCAL))
         .expect("peer must be present in the result map");
     assert!(!success, "wedged send should not have succeeded");
     assert!(

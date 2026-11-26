@@ -45,7 +45,7 @@ use subduction_core::{
     },
     effects::config::Config,
     handler::{Handler, sync::SyncHandler},
-    peer::id::PeerId,
+    peer::{id::PeerId, session::Session},
     remote_heads::{RemoteHeads, RemoteHeadsNotifier},
     storage::memory::MemoryStorage,
     subduction::{
@@ -230,9 +230,12 @@ impl<T: NodeTransport> Node<T> {
         &self,
         auth: Authenticated<NodeConn<T>, Sendable>,
     ) -> Result<(), AddConnectionError<keyhive_crypto::identifier::InvalidIdentifier>> {
-        let peer = auth.peer_id();
+        let session = auth.session();
         self.subduction.add_connection(auth).await?;
-        self.keyhive_handler.add_peer(peer).await;
+        self.keyhive_handler
+            .add_peer(session)
+            .await
+            .expect("a node's keyhive handler speaks for its own principal");
         Ok(())
     }
 
@@ -252,7 +255,11 @@ impl<T: NodeTransport> Node<T> {
             Sendable,
         >,
     > {
-        self.keyhive_handler.protocol().sync_keyhive(None).await
+        self.keyhive_handler
+            .protocol(&self.peer_id())
+            .expect("a node's keyhive handler speaks for its own principal")
+            .sync_keyhive(None)
+            .await
     }
 }
 
@@ -267,16 +274,18 @@ impl Node<ChannelTransport> {
         other: &Self,
     ) -> Result<(), AddConnectionError<keyhive_crypto::identifier::InvalidIdentifier>> {
         let (ours, theirs) = ChannelTransport::pair();
-        self.attach(Authenticated::new_for_test(
+        self.attach(Authenticated::new_for_test_as(
             MessageTransport::new(ours),
             other.peer_id(),
+            self.peer_id(),
             Direction::Dialed,
         ))
         .await?;
         other
-            .attach(Authenticated::new_for_test(
+            .attach(Authenticated::new_for_test_as(
                 MessageTransport::new(theirs),
                 self.peer_id(),
+                other.peer_id(),
                 Direction::Accepted,
             ))
             .await
@@ -461,10 +470,10 @@ impl<T: NodeTransport> Handler<Sendable, NodeConn<T>> for NodeHandler<T> {
         .boxed()
     }
 
-    fn on_peer_disconnect(&self, peer: PeerId) -> BoxFuture<'_, ()> {
+    fn on_peer_disconnect(&self, session: Session) -> BoxFuture<'_, ()> {
         async move {
-            Handler::<Sendable, NodeConn<T>>::on_peer_disconnect(self.sync.as_ref(), peer).await;
-            Handler::<Sendable, NodeConn<T>>::on_peer_disconnect(&self.keyhive, peer).await;
+            Handler::<Sendable, NodeConn<T>>::on_peer_disconnect(self.sync.as_ref(), session).await;
+            Handler::<Sendable, NodeConn<T>>::on_peer_disconnect(&self.keyhive, session).await;
         }
         .boxed()
     }

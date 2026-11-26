@@ -20,6 +20,7 @@ use std::{
     },
     time::Duration,
 };
+use subduction_core::peer::session::{Session, TEST_LOCAL};
 
 use async_lock::Mutex;
 use future_form::{FutureForm, Sendable};
@@ -129,7 +130,7 @@ impl Connection<Sendable, EphemeralMessage> for WedgeableConn {
 // ── Helpers ─────────────────────────────────────────────────────────────
 
 type Auth = Authenticated<WedgeableConn, Sendable>;
-type Connections = Arc<Mutex<Map<PeerId, NonEmpty<Auth>>>>;
+type Connections = Arc<Mutex<Map<Session, NonEmpty<Auth>>>>;
 type OpenHandler =
     Arc<EphemeralHandler<Sendable, WedgeableConn, OpenEphemeralPolicy, FakeClock, TokioSpawn>>;
 
@@ -158,7 +159,7 @@ async fn register(connections: &Connections, conn: WedgeableConn) -> Auth {
     connections
         .lock()
         .await
-        .insert(peer_id, NonEmpty::new(auth.clone()));
+        .insert(auth.session(), NonEmpty::new(auth.clone()));
     auth
 }
 
@@ -364,8 +365,13 @@ async fn disconnect_resets_inflight_accounting() -> TestResult {
 
     // The keepalive reaper (or teardown) removes the connection; the
     // handler is told about it. This must clear the in-flight counter.
-    connections.lock().await.remove(&peer(2));
-    handler.on_peer_disconnect(peer(2)).await;
+    connections
+        .lock()
+        .await
+        .remove(&Session::new(peer(2), TEST_LOCAL));
+    handler
+        .on_peer_disconnect(Session::new(peer(2), TEST_LOCAL))
+        .await;
 
     // Peer(2) reconnects healthy and re-subscribes.
     let (fresh_conn, fresh_rx) = WedgeableConn::healthy(peer(2));

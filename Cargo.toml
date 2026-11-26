@@ -145,13 +145,13 @@ windows-sys = "0.61.2"
 # Keyhive from the dman-os fork (explicit document hydration behind KeyhiveStore). One source
 # per crate, so every keyhive crate in the graph resolves to the same revision.
 [patch.crates-io]
-beekem = { git = "https://github.com/dman-os/keyhive", rev = "94ff62a124cfb8e795168e9ca60d7d528fc90469" }
-keyhive_codec = { git = "https://github.com/dman-os/keyhive", rev = "94ff62a124cfb8e795168e9ca60d7d528fc90469" }
-keyhive_content = { git = "https://github.com/dman-os/keyhive", rev = "94ff62a124cfb8e795168e9ca60d7d528fc90469" }
-keyhive_core = { git = "https://github.com/dman-os/keyhive", rev = "94ff62a124cfb8e795168e9ca60d7d528fc90469" }
-keyhive_crypto = { git = "https://github.com/dman-os/keyhive", rev = "94ff62a124cfb8e795168e9ca60d7d528fc90469" }
-keyline = { git = "https://github.com/dman-os/keyhive", rev = "94ff62a124cfb8e795168e9ca60d7d528fc90469" }
-keyline_memory = { git = "https://github.com/dman-os/keyhive", rev = "94ff62a124cfb8e795168e9ca60d7d528fc90469" }
+beekem = { git = "https://github.com/dman-os/keyhive", rev = "a41afc079b000a09ac07c93c655d90b736207eb5" }
+keyhive_codec = { git = "https://github.com/dman-os/keyhive", rev = "a41afc079b000a09ac07c93c655d90b736207eb5" }
+keyhive_content = { git = "https://github.com/dman-os/keyhive", rev = "a41afc079b000a09ac07c93c655d90b736207eb5" }
+keyhive_core = { git = "https://github.com/dman-os/keyhive", rev = "a41afc079b000a09ac07c93c655d90b736207eb5" }
+keyhive_crypto = { git = "https://github.com/dman-os/keyhive", rev = "a41afc079b000a09ac07c93c655d90b736207eb5" }
+keyline = { git = "https://github.com/dman-os/keyhive", rev = "a41afc079b000a09ac07c93c655d90b736207eb5" }
+keyline_memory = { git = "https://github.com/dman-os/keyhive", rev = "a41afc079b000a09ac07c93c655d90b736207eb5" }
 
 [workspace.lints.rust]
 future_incompatible = { level = "warn", priority = -1 }

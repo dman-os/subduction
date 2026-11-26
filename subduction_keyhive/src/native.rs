@@ -113,7 +113,8 @@ where
     fn total_ops(&self) -> F::Future<'_, Result<u64, NativeKeyhiveError<K::Error>>> {
         // The protocol compares two counts to see whether an ingest changed
         // anything, so all it needs is a count that grows with what keyhive
-        // holds, and that does not move when a document is loaded.
+        // holds. Keyhive reads it from one counter in its store, so it does not
+        // move when a document is loaded and loads none itself.
         F::from_future(async move { Ok(Keyhive::total_ops(self).await?) })
     }
 
@@ -257,9 +258,9 @@ where
             for doc in docs.into_iter().chain(waiting) {
                 self.hydrate(doc).await?;
             }
-            // And the individuals whose prekey operations arrive: `total_ops` counts one
-            // that is loaded from memory, which must hold what the store does for the
-            // count not to move when it is loaded.
+            // And the individuals whose prekey operations arrive: keyhive merges them
+            // into the individual it holds in memory, which must hold what the store
+            // does or the merge would diverge from the stored prekey state.
             let issuers: Vec<IndividualId> = decoded
                 .iter()
                 .filter_map(|event| match event {

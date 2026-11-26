@@ -38,7 +38,7 @@
 //!         })
 //!     }
 //!
-//!     fn on_peer_disconnect(&self, _peer: PeerId) -> Async::Future<'_, ()> {
+//!     fn on_peer_disconnect(&self, _session: Session) -> Async::Future<'_, ()> {
 //!         Async::from_future(async {})
 //!     }
 //! }
@@ -56,7 +56,7 @@ use sedimentree_core::codec::{decode::Decode, encode::Encode};
 use crate::{
     authenticated::Authenticated,
     connection::message::{TryAsBatchSyncResponse, TryAsSubscribeRequest},
-    peer::id::PeerId,
+    peer::session::Session,
 };
 
 /// A handler for messages received from authenticated peers.
@@ -121,7 +121,7 @@ pub trait Handler<Async: FutureForm, Conn: Clone> {
         message: Self::Message,
     ) -> Async::Future<'a, Result<(), Self::HandlerError>>;
 
-    /// Called when a peer's last connection drops.
+    /// Called when a session's last connection drops.
     ///
     /// Use this hook to clean up per-peer state such as subscription
     /// maps, presence records, or other resources scoped to a peer's
@@ -131,5 +131,5 @@ pub trait Handler<Async: FutureForm, Conn: Clone> {
     /// that the peer has no remaining connections.
     ///
     /// [`remove_connection`]: crate::subduction::Subduction::remove_connection
-    fn on_peer_disconnect(&self, peer: PeerId) -> Async::Future<'_, ()>;
+    fn on_peer_disconnect(&self, session: Session) -> Async::Future<'_, ()>;
 }

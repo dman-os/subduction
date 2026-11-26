@@ -456,11 +456,13 @@ pub async fn initiate<K: FutureForm, H: Handshake<K>, C: Clone, E, S: Signer<K>>
     now: TimestampSeconds,
     nonce: Nonce,
 ) -> Result<(Authenticated<C, K>, E), AuthenticateError<H::Error>> {
-    // Every success path of `initiate` yields a dialed connection.
+    // Every success path of `initiate` yields a dialed connection, signed
+    // as the principal behind `signer`.
+    let local_id = PeerId::from(signer.verifying_key());
     let dialed = |handshake: H, peer_id: PeerId| {
         let (conn, extra) = build_connection(handshake, peer_id);
         (
-            Authenticated::from_handshake(conn, peer_id, Direction::Dialed),
+            Authenticated::from_handshake(conn, peer_id, local_id, Direction::Dialed),
             extra,
         )
     };
@@ -700,7 +702,12 @@ pub async fn respond<K: FutureForm, H: Handshake<K>, C: Clone, E, S: Signer<K>>(
     let peer_id = verified.client_id;
     let (conn, extra) = build_connection(handshake, peer_id);
     Ok((
-        Authenticated::from_handshake(conn, peer_id, Direction::Accepted),
+        Authenticated::from_handshake(
+            conn,
+            peer_id,
+            PeerId::from(signer.verifying_key()),
+            Direction::Accepted,
+        ),
         extra,
     ))
 }

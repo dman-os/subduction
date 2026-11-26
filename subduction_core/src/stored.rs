@@ -58,6 +58,10 @@ pub enum StoredEvent {
     StorageChecked,
     /// A load-initiated peer round completed its accepted local processing.
     /// This is not universal acceptance, replica equality, or remote persistence.
+    ///
+    /// The marker names the remote peer, not the session. A peer reached under
+    /// several local principals completes one round per session, so the same
+    /// `peer_id` can be reported more than once for one load.
     PeerSynced {
         /// Authenticated peer whose round completed.
         peer_id: PeerId,

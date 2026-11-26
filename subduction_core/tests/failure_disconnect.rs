@@ -20,7 +20,7 @@ use subduction_core::{
     },
     effects::config::Config,
     handler::Handler,
-    peer::id::PeerId,
+    peer::{id::PeerId, session::Session},
     policy::open::OpenPolicy,
     remote_heads::{RemoteHeads, RemoteHeadsNotifier},
     storage::memory::MemoryStorage,
@@ -140,7 +140,7 @@ impl Handler<Sendable, Conn> for RejectMessages {
     ) -> BoxFuture<'a, Result<(), Self::HandlerError>> {
         Box::pin(async { Err(ListenError::TrySendError) })
     }
-    fn on_peer_disconnect(&self, _peer: PeerId) -> BoxFuture<'_, ()> {
+    fn on_peer_disconnect(&self, _session: Session) -> BoxFuture<'_, ()> {
         Box::pin(async {})
     }
 }
@@ -260,7 +260,7 @@ async fn explicit_bulk_apis_do_not_schedule_duplicate_cleanup() -> TestResult {
         owner_a.finish();
         owner_b.finish();
         if per_peer {
-            assert!(node.core.disconnect_from_peer(&a.peer_id()).await?);
+            assert!(node.core.disconnect_from_peer(&a.session()).await?);
         } else {
             node.core.disconnect_all().await?;
         }
@@ -283,7 +283,7 @@ async fn protocol_failure(bytes: &[u8]) -> TestResult {
     owner.started().await?;
     assert_eq!(calls(&failed), 1);
     assert_eq!(calls(&sibling), 0);
-    assert_eq!(node.core.connection_count(&failed.peer_id()).await, 1);
+    assert_eq!(node.core.connection_count(&failed.session()).await, 1);
     // A blocked cleanup must not prevent the listener from removing another
     // peer's failed connection. Waiting inline in remove_connection deadlocks.
     other_owner.remote.send_bytes(bytes).await?;

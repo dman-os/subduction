@@ -90,7 +90,7 @@ use crate::{
     minimized_tree_store::{MinimizedTreeStore, memory::MemoryMinimizedTreeStore},
     multiplexer::DEFAULT_ROUNDTRIP_TIMEOUT,
     nonce_cache::NonceCache,
-    peer::{counter::PeerCounter, id::PeerId},
+    peer::{counter::PeerCounter, session::Session},
     policy::{connection::ConnectionPolicy, storage::StoragePolicy},
     remote_heads::{NoRemoteHeadsObserver, RemoteHeadsNotifier, RemoteHeadsObserver},
     spawn::Spawn,
@@ -673,9 +673,9 @@ impl<Sign, Sp, Store, Policy, Timer, Metric: DepthMetric, HeadsObserver: RemoteH
     {
         let minimized_tree_store = self.minimized_tree_store;
 
-        let connections: Arc<Mutex<Map<PeerId, NonEmpty<Authenticated<Conn, Async>>>>> =
+        let connections: Arc<Mutex<Map<Session, NonEmpty<Authenticated<Conn, Async>>>>> =
             Arc::new(Mutex::new(Map::new()));
-        let subscriptions: Arc<Mutex<Map<SedimentreeId, Set<PeerId>>>> =
+        let subscriptions: Arc<Mutex<Map<SedimentreeId, Set<Session>>>> =
             Arc::new(Mutex::new(Map::new()));
         let nonce_cache = self.nonce_cache.unwrap_or_default();
 
@@ -800,9 +800,9 @@ impl<Sign, Sp, Store, Policy, Timer, Metric: DepthMetric, Trees>
     {
         let minimized_tree_store = self.minimized_tree_store;
 
-        let connections: Arc<Mutex<Map<PeerId, NonEmpty<Authenticated<Conn, Async>>>>> =
+        let connections: Arc<Mutex<Map<Session, NonEmpty<Authenticated<Conn, Async>>>>> =
             Arc::new(Mutex::new(Map::new()));
-        let subscriptions: Arc<Mutex<Map<SedimentreeId, Set<PeerId>>>> =
+        let subscriptions: Arc<Mutex<Map<SedimentreeId, Set<Session>>>> =
             Arc::new(Mutex::new(Map::new()));
         let nonce_cache = self.nonce_cache.unwrap_or_default();
 
@@ -928,9 +928,9 @@ impl<Sign, Sp, Store, Policy, Timer, Metric: DepthMetric, HeadsObserver: RemoteH
     {
         let minimized_tree_store = self.minimized_tree_store;
 
-        let connections: Arc<Mutex<Map<PeerId, NonEmpty<Authenticated<Conn, Async>>>>> =
+        let connections: Arc<Mutex<Map<Session, NonEmpty<Authenticated<Conn, Async>>>>> =
             Arc::new(Mutex::new(Map::new()));
-        let subscriptions: Arc<Mutex<Map<SedimentreeId, Set<PeerId>>>> =
+        let subscriptions: Arc<Mutex<Map<SedimentreeId, Set<Session>>>> =
             Arc::new(Mutex::new(Map::new()));
         let nonce_cache = self.nonce_cache.unwrap_or_default();
 

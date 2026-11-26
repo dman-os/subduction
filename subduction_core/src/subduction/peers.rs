@@ -22,7 +22,7 @@ use sedimentree_core::{
 use crate::{
     authenticated::{Authenticated, Direction},
     connection::{Connection, message::SyncMessage},
-    peer::{counter::PeerCounter, id::PeerId},
+    peer::{counter::PeerCounter, id::PeerId, session::Session},
     policy::storage::StoragePolicy,
     remote_heads::RemoteHeads,
     storage::{powerbox::StoragePowerbox, traits::Storage},
@@ -31,36 +31,36 @@ use crate::{
 use super::ingest::Ingested;
 use sedimentree_core::codec::{decode::Decode, encode::Encode};
 
-/// Record that `peer_id` is subscribed to `sedimentree_id`.
+/// Record that `session` is subscribed to `sedimentree_id`.
 pub(crate) async fn add_subscription(
-    subscriptions: &Mutex<Map<SedimentreeId, Set<PeerId>>>,
-    peer_id: PeerId,
+    subscriptions: &Mutex<Map<SedimentreeId, Set<Session>>>,
+    session: Session,
     sedimentree_id: SedimentreeId,
 ) {
     let mut guard = subscriptions.lock().await;
-    guard.entry(sedimentree_id).or_default().insert(peer_id);
+    guard.entry(sedimentree_id).or_default().insert(session);
 }
 
-/// Remove `peer_id` from all subscription sets.
+/// Remove `session` from all subscription sets.
 ///
-/// Called when the last connection for a peer drops.
+/// Called when the last connection of a session drops.
 /// Empty subscription entries are pruned.
-pub(crate) async fn remove_peer_from_subscriptions(
-    subscriptions: &Mutex<Map<SedimentreeId, Set<PeerId>>>,
-    peer_id: PeerId,
+pub(crate) async fn remove_session_from_subscriptions(
+    subscriptions: &Mutex<Map<SedimentreeId, Set<Session>>>,
+    session: Session,
 ) {
     let mut guard = subscriptions.lock().await;
-    guard.retain(|_id, peers| {
-        peers.remove(&peer_id);
-        !peers.is_empty()
+    guard.retain(|_id, sessions| {
+        sessions.remove(&session);
+        !sessions.is_empty()
     });
 }
 
 /// Get connections for subscribers authorized to receive updates for
-/// a sedimentree, excluding a specific peer.
+/// a sedimentree, excluding every session of a specific peer.
 ///
-/// For each subscriber, checks policy to confirm they are allowed to
-/// fetch this sedimentree before including their connections.
+/// For each subscribed session, checks policy to confirm its remote peer is
+/// allowed to fetch this sedimentree before including its connections.
 pub(crate) async fn get_authorized_subscriber_conns<
     Async: FutureForm,
     Store: Storage<Async>,
@@ -68,44 +68,44 @@ pub(crate) async fn get_authorized_subscriber_conns<
     WireMsg: Encode + Decode,
     Auth: StoragePolicy<Async>,
 >(
-    subscriptions: &Mutex<Map<SedimentreeId, Set<PeerId>>>,
+    subscriptions: &Mutex<Map<SedimentreeId, Set<Session>>>,
     storage: &StoragePowerbox<Store, Auth, Async>,
-    connections: &Mutex<Map<PeerId, NonEmpty<Authenticated<Conn, Async>>>>,
+    connections: &Mutex<Map<Session, NonEmpty<Authenticated<Conn, Async>>>>,
     sedimentree_id: SedimentreeId,
     exclude_peer: &PeerId,
 ) -> Vec<Authenticated<Conn, Async>> {
-    let subscriber_ids: Vec<PeerId> = {
+    let subscribed: Vec<Session> = {
         let guard = subscriptions.lock().await;
         guard
             .get(&sedimentree_id)
-            .map(|peers| peers.iter().copied().collect())
+            .map(|sessions| sessions.iter().copied().collect())
             .unwrap_or_default()
     };
 
-    if subscriber_ids.is_empty() {
+    if subscribed.is_empty() {
         return Vec::new();
     }
 
-    let mut authorized_peers = Vec::new();
-    for peer_id in subscriber_ids {
-        if peer_id == *exclude_peer {
+    let mut authorized = Vec::new();
+    for session in subscribed {
+        if session.remote() == *exclude_peer {
             continue;
         }
         let can_fetch = storage
             .policy()
-            .filter_authorized_fetch(peer_id, alloc::vec![sedimentree_id])
+            .filter_authorized_fetch(session.remote(), alloc::vec![sedimentree_id])
             .await;
         if !can_fetch.is_empty() {
-            authorized_peers.push(peer_id);
+            authorized.push(session);
         }
     }
 
     let guard = connections.lock().await;
-    authorized_peers
+    authorized
         .into_iter()
-        .flat_map(|pid| {
+        .flat_map(|session| {
             guard
-                .get(&pid)
+                .get(&session)
                 .map(|conns| conns.iter().cloned().collect::<Vec<_>>())
                 .unwrap_or_default()
         })
@@ -205,20 +205,21 @@ impl<Async: FutureForm, Conn, WireMsg: Encode + Decode> SendPushes<Conn, WireMsg
     }
 }
 
-/// The peers a subscribe from `originator` is forwarded to: every peer other
-/// than `originator` with at least one connection this node dialed. Upstream
-/// is a property of the peer, not of any one connection.
-pub fn upstream_peers<D: IntoIterator<Item = Direction>>(
-    peers: impl IntoIterator<Item = (PeerId, D)>,
+/// The sessions a subscribe from `originator` is forwarded to: every session
+/// whose remote is not `originator` and that has at least one connection this
+/// node dialed. Upstream is a property of the session, not of any one
+/// connection.
+pub fn upstream_sessions<D: IntoIterator<Item = Direction>>(
+    sessions: impl IntoIterator<Item = (Session, D)>,
     originator: PeerId,
-) -> Vec<PeerId> {
-    peers
+) -> Vec<Session> {
+    sessions
         .into_iter()
-        .filter(|(peer, _)| *peer != originator)
-        .filter_map(|(peer, dirs)| {
+        .filter(|(session, _)| session.remote() != originator)
+        .filter_map(|(session, dirs)| {
             dirs.into_iter()
                 .any(|d| d == Direction::Dialed)
-                .then_some(peer)
+                .then_some(session)
         })
         .collect()
 }

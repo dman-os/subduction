@@ -10,14 +10,16 @@ use sedimentree_core::codec::{decode::Decode, encode::Encode};
 
 use crate::{
     connection::{Connection, Reconnect},
-    peer::id::PeerId,
+    peer::{id::PeerId, session::Session},
 };
 
 /// A connection that has completed handshake verification.
 ///
 /// This is a witness type proving the connection was authenticated.
 /// The inner connection has been verified via cryptographic handshake,
-/// and the `peer_id` is the verified identity from the handshake.
+/// the `peer_id` is the verified identity of the remote end from the
+/// handshake, and `local_id` is the local principal that signed it. Together
+/// they name the [`Session`].
 ///
 /// # Type Parameters
 ///
@@ -37,6 +39,7 @@ use crate::{
 pub struct Authenticated<Conn: Clone, Async: FutureForm> {
     inner: Conn,
     peer_id: PeerId,
+    local_id: PeerId,
     direction: Direction,
     _marker: PhantomData<fn() -> Async>,
 }
@@ -62,6 +65,7 @@ impl<Conn: Clone, Async: FutureForm> Clone for Authenticated<Conn, Async> {
         Self {
             inner: self.inner.clone(),
             peer_id: self.peer_id,
+            local_id: self.local_id,
             direction: self.direction,
             _marker: PhantomData,
         }
@@ -80,6 +84,7 @@ impl<Conn: Clone + core::fmt::Debug, Async: FutureForm> core::fmt::Debug
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Authenticated")
             .field("peer_id", &self.peer_id)
+            .field("local_id", &self.local_id)
             .field("direction", &self.direction)
             .field("inner", &self.inner)
             .finish()
@@ -95,10 +100,16 @@ impl<Conn: Clone, Async: FutureForm> Authenticated<Conn, Async> {
     ///
     /// [`handshake::initiate`]: super::handshake::initiate
     /// [`handshake::respond`]: super::handshake::respond
-    pub(crate) fn from_handshake(inner: Conn, peer_id: PeerId, direction: Direction) -> Self {
+    pub(crate) fn from_handshake(
+        inner: Conn,
+        peer_id: PeerId,
+        local_id: PeerId,
+        direction: Direction,
+    ) -> Self {
         Self {
             inner,
             peer_id,
+            local_id,
             direction,
             _marker: PhantomData,
         }
@@ -107,6 +118,21 @@ impl<Conn: Clone, Async: FutureForm> Authenticated<Conn, Async> {
     /// The verified peer identity, established during the handshake.
     pub const fn peer_id(&self) -> PeerId {
         self.peer_id
+    }
+
+    /// The local principal that signed this connection's handshake.
+    ///
+    /// This is the node's own key for an ordinary session, or a shared
+    /// principal's key for a session opened under one. The remote authorizes
+    /// the session by this principal's power, not by the node's.
+    pub const fn local_id(&self) -> PeerId {
+        self.local_id
+    }
+
+    /// The session this connection belongs to: the remote peer and the local
+    /// principal that authenticated it.
+    pub const fn session(&self) -> Session {
+        Session::new(self.peer_id, self.local_id)
     }
 
     /// Which side of the handshake this node was on.
@@ -124,21 +150,37 @@ impl<Conn: Clone, Async: FutureForm> Authenticated<Conn, Async> {
         Authenticated {
             inner: f(self.inner),
             peer_id: self.peer_id,
+            local_id: self.local_id,
             direction: self.direction,
             _marker: PhantomData,
         }
     }
 
-    /// Construct for testing purposes only.
+    /// Construct for testing purposes only, as the [`TEST_LOCAL`] principal.
     ///
     /// This bypasses handshake verification and should only be used in tests.
     /// Callers state which side of the (skipped) handshake this end is on,
     /// since propagation behavior depends on it.
+    ///
+    /// [`TEST_LOCAL`]: crate::peer::session::TEST_LOCAL
     #[cfg(any(test, feature = "test_utils"))]
     pub fn new_for_test(inner: Conn, peer_id: PeerId, direction: Direction) -> Self {
+        Self::new_for_test_as(inner, peer_id, crate::peer::session::TEST_LOCAL, direction)
+    }
+
+    /// Like [`new_for_test`](Self::new_for_test), for a session as an
+    /// explicit local principal.
+    #[cfg(any(test, feature = "test_utils"))]
+    pub fn new_for_test_as(
+        inner: Conn,
+        peer_id: PeerId,
+        local_id: PeerId,
+        direction: Direction,
+    ) -> Self {
         Self {
             inner,
             peer_id,
+            local_id,
             direction,
             _marker: PhantomData,
         }

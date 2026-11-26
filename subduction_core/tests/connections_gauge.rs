@@ -11,6 +11,7 @@
 #![allow(clippy::expect_used, clippy::panic)]
 
 use std::sync::Arc;
+use subduction_core::peer::session::{Session, TEST_LOCAL};
 
 use future_form::Sendable;
 use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
@@ -108,7 +109,7 @@ fn connections_gauge_healed_by_every_mutation() {
                 .expect("re-add a");
             poison();
             subduction
-                .disconnect_from_peer(&peer_a)
+                .disconnect_from_peer(&Session::new(peer_a, TEST_LOCAL))
                 .await
                 .expect("disconnect_from_peer");
             assert_eq!(gauge(&snapshotter), Some(0.0), "disconnect_from_peer heals");

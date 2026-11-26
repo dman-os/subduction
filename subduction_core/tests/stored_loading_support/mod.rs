@@ -12,6 +12,7 @@ use subduction_core::{
     connection::test_utils::{PausableChannelTransport, TokioSpawn, TokioTimeout},
     effects::config::Config,
     handler::sync::SyncHandler,
+    peer::session::{Session, TEST_LOCAL},
     policy::open::OpenPolicy,
     storage::{memory::MemoryStorage, traits::Storage},
     stored::{LoadError, StoredEvent, StoredItem},
@@ -252,7 +253,11 @@ async fn cached_loading_keeps_streaming_while_peer_is_stalled() {
     // Wait beyond the configured roundtrip timeout. Loading does not use it,
     // and a stalled peer must not prevent local updates from being delivered.
     tokio::time::sleep(Duration::from_millis(60)).await;
-    assert!(a.get_peer_subscriptions(b.peer_id()).await.is_empty());
+    assert!(
+        a.get_peer_subscriptions(Session::new(b.peer_id(), TEST_LOCAL))
+            .await
+            .is_empty()
+    );
     a.store_commit(
         id,
         CommitId::new([2; 32]),
@@ -367,7 +372,11 @@ async fn cached_loading_syncs_stale_contents_and_subscribes() {
     ));
     assert!(matches!(super::next(&mut stream).await,
         StoredEvent::PeerSynced { peer_id } if peer_id == b.peer_id()));
-    assert!(a.get_peer_subscriptions(b.peer_id()).await.contains(&id));
+    assert!(
+        a.get_peer_subscriptions(Session::new(b.peer_id(), TEST_LOCAL))
+            .await
+            .contains(&id)
+    );
     b.add_commit(
         id,
         CommitId::new([3; 32]),
@@ -422,8 +431,16 @@ async fn loading_subscribes_to_all_current_peers(cached: bool) {
     }
     for b in peers {
         assert!(synced.contains(&b.peer_id()));
-        assert!(a.get_peer_subscriptions(b.peer_id()).await.contains(&id));
-        assert!(b.get_subscribers(id).await.contains(&a.peer_id()));
+        assert!(
+            a.get_peer_subscriptions(Session::new(b.peer_id(), TEST_LOCAL))
+                .await
+                .contains(&id)
+        );
+        assert!(
+            b.get_subscribers(id)
+                .await
+                .contains(&Session::new(a.peer_id(), TEST_LOCAL))
+        );
         b.shutdown();
     }
     a.shutdown();
@@ -463,7 +480,11 @@ async fn cached_fetch_still_does_not_contact_peers() {
         1
     );
     assert_eq!(a.send_counter_value(&b.peer_id()).await, before);
-    assert!(a.get_peer_subscriptions(b.peer_id()).await.is_empty());
+    assert!(
+        a.get_peer_subscriptions(Session::new(b.peer_id(), TEST_LOCAL))
+            .await
+            .is_empty()
+    );
     a.shutdown();
     b.shutdown();
 }
@@ -732,8 +753,16 @@ async fn dropping_a_loaded_watcher_leaves_its_subscription_node_owned() {
         StoredEvent::PeerSynced { .. }
     ) {}
     stream.close();
-    assert!(a.get_peer_subscriptions(b.peer_id()).await.contains(&id));
-    assert!(b.get_subscribers(id).await.contains(&a.peer_id()));
+    assert!(
+        a.get_peer_subscriptions(Session::new(b.peer_id(), TEST_LOCAL))
+            .await
+            .contains(&id)
+    );
+    assert!(
+        b.get_subscribers(id)
+            .await
+            .contains(&Session::new(a.peer_id(), TEST_LOCAL))
+    );
     a.shutdown();
     b.shutdown();
 }
@@ -770,7 +799,7 @@ async fn collecting_unknown_tree_uses_supplier_readiness_and_establishes_no_subs
         .expect("unknown tree supplied");
     assert_eq!(blobs.len(), 3, "not the first item or empty peer marker");
     assert!(
-        a.get_peer_subscriptions(supplier.peer_id())
+        a.get_peer_subscriptions(Session::new(supplier.peer_id(), TEST_LOCAL))
             .await
             .is_empty()
     );
@@ -805,7 +834,11 @@ async fn collecting_overflow_recovers_before_returning_and_preserves_timeout_err
         .expect("recovery")
         .expect("available");
     assert_eq!(blobs.len(), 260);
-    assert!(a.get_peer_subscriptions(b.peer_id()).await.is_empty());
+    assert!(
+        a.get_peer_subscriptions(Session::new(b.peer_id(), TEST_LOCAL))
+            .await
+            .is_empty()
+    );
     transport.pause();
     assert!(matches!(
         a.fetch_blobs(SedimentreeId::new([52; 32]), CallTimeout::TimeoutMillis(30))

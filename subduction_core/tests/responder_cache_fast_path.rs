@@ -22,6 +22,7 @@ use std::{
     },
     time::Duration,
 };
+use subduction_core::peer::session::{Session, TEST_LOCAL};
 
 use alloc::vec::Vec;
 use future_form::Sendable;
@@ -330,7 +331,7 @@ async fn responder_serves_resident_tree_without_bulk_scans() -> TestResult {
     let bob_peer_id = PeerId::from(bob_signer.verifying_key());
     let (synced, _stats, send_errors) = alice
         .sync_with_peer(
-            &bob_peer_id,
+            &Session::new(bob_peer_id, TEST_LOCAL),
             sed_id,
             false,
             CallTimeout::TimeoutMillis(2_000),
@@ -410,7 +411,7 @@ async fn cold_clone_of_resident_tree_uses_bulk_scan() -> TestResult {
     let bob_peer_id = PeerId::from(bob_signer.verifying_key());
     let (synced, _stats, send_errors) = alice
         .sync_with_peer(
-            &bob_peer_id,
+            &Session::new(bob_peer_id, TEST_LOCAL),
             sed_id,
             false,
             CallTimeout::TimeoutMillis(5_000),
@@ -486,7 +487,7 @@ async fn slow_path_warms_cache_for_subsequent_requests() -> TestResult {
     let bulk_before_first = bob_storage.bulk_loads();
     let (synced, _stats, send_errors) = alice
         .sync_with_peer(
-            &bob_peer_id,
+            &Session::new(bob_peer_id, TEST_LOCAL),
             sed_id,
             false,
             CallTimeout::TimeoutMillis(2_000),
@@ -510,7 +511,7 @@ async fn slow_path_warms_cache_for_subsequent_requests() -> TestResult {
     let bulk_before_second = bob_storage.bulk_loads();
     let (synced, _stats, send_errors) = alice
         .sync_with_peer(
-            &bob_peer_id,
+            &Session::new(bob_peer_id, TEST_LOCAL),
             sed_id,
             false,
             CallTimeout::TimeoutMillis(2_000),
@@ -579,7 +580,7 @@ async fn cache_ahead_of_storage_omits_phantom_items() -> TestResult {
     let bob_peer_id = PeerId::from(bob_signer.verifying_key());
     let (synced, _stats, send_errors) = alice
         .sync_with_peer(
-            &bob_peer_id,
+            &Session::new(bob_peer_id, TEST_LOCAL),
             sed_id,
             false,
             CallTimeout::TimeoutMillis(2_000),
@@ -659,7 +660,7 @@ async fn moderate_diff_on_large_tree_stays_on_point_reads() -> TestResult {
     let bob_peer_id = PeerId::from(bob_signer.verifying_key());
     let (synced, _stats, send_errors) = alice
         .sync_with_peer(
-            &bob_peer_id,
+            &Session::new(bob_peer_id, TEST_LOCAL),
             sed_id,
             false,
             CallTimeout::TimeoutMillis(5_000),

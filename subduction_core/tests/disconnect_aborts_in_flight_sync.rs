@@ -18,6 +18,7 @@ use std::{
     },
     time::Duration,
 };
+use subduction_core::peer::session::{Session, TEST_LOCAL};
 
 use future_form::Sendable;
 use futures::future::{AbortHandle, Abortable, BoxFuture};
@@ -70,7 +71,7 @@ fn make_node(signer: MemorySigner) -> TestSubduction {
 /// Pull out the single connection registered for `peer` so we can
 /// hand it to `disconnect()` (the per-connection variant).
 async fn single_conn(sd: &TestSubduction, peer: PeerId) -> Authenticated<Conn, Sendable> {
-    sd.get_connection(&peer)
+    sd.get_connection(&Session::new(peer, TEST_LOCAL))
         .await
         .expect("peer connection must be registered")
 }
@@ -133,7 +134,12 @@ async fn disconnect_one_of_two_connections_cancels_only_its_pending_calls() -> T
     let syncing = a.clone();
     let sync = tokio::spawn(async move {
         syncing
-            .sync_with_peer(&peer_b, id, false, LONG_PER_CALL_TIMEOUT)
+            .sync_with_peer(
+                &Session::new(peer_b, TEST_LOCAL),
+                id,
+                false,
+                LONG_PER_CALL_TIMEOUT,
+            )
             .await
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -147,7 +153,7 @@ async fn disconnect_one_of_two_connections_cancels_only_its_pending_calls() -> T
         errors.first().map(|e| &e.1),
         Some(CallError::ResponseDropped)
     ));
-    assert_eq!(a.mux_count(&peer_b).await, 1);
+    assert_eq!(a.mux_count(&Session::new(peer_b, TEST_LOCAL)).await, 1);
     a.shutdown();
     b.shutdown();
     Ok(())
@@ -179,7 +185,8 @@ async fn disconnect_from_peer_cancels_in_flight_sync_with_all_peers() -> TestRes
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let b_peer = PeerId::from(b_signer.verifying_key());
-    a.disconnect_from_peer(&b_peer).await?;
+    a.disconnect_from_peer(&Session::new(b_peer, TEST_LOCAL))
+        .await?;
 
     let result = tokio::time::timeout(BOUND, sync_handle).await;
     assert!(
@@ -195,7 +202,7 @@ async fn disconnect_from_peer_cancels_in_flight_sync_with_all_peers() -> TestRes
     // `ResponseDropped` (cancelled via the dropped mux sender), not
     // `Timeout`, so a slow timeout can't masquerade as a pass.
     let (success, _stats, conn_errs) = result
-        .get(&b_peer)
+        .get(&Session::new(b_peer, TEST_LOCAL))
         .expect("wedged peer must be present in the result map");
     assert!(!success, "peer should not have succeeded");
     assert_eq!(
@@ -253,7 +260,7 @@ async fn disconnect_single_conn_when_last_cancels_in_flight_sync() -> TestResult
     // sender (`ResponseDropped`), not resolved by the per-call timeout.
     let map = result.expect("join error").expect("task panicked")?;
     let (success, _stats, conn_errs) = map
-        .get(&b_peer)
+        .get(&Session::new(b_peer, TEST_LOCAL))
         .expect("wedged peer must be present in the result map");
     assert!(!success, "peer should not have succeeded");
     assert!(
@@ -315,7 +322,7 @@ async fn remove_connection_cancels_in_flight_then_second_removal_is_noop() -> Te
 
     // And the mux must be gone afterwards (no leak).
     assert_eq!(
-        a.mux_count(&b_peer).await,
+        a.mux_count(&Session::new(b_peer, TEST_LOCAL)).await,
         0,
         "mux entry must be removed once the peer's last connection is gone"
     );
@@ -323,7 +330,11 @@ async fn remove_connection_cancels_in_flight_then_second_removal_is_noop() -> Te
     // Second removal of the already-gone connection: clean None no-op.
     let res2 = a.remove_connection_for_test(&b_conn).await;
     assert_eq!(res2, None);
-    assert_eq!(a.mux_count(&b_peer).await, 0, "no mux must be resurrected");
+    assert_eq!(
+        a.mux_count(&Session::new(b_peer, TEST_LOCAL)).await,
+        0,
+        "no mux must be resurrected"
+    );
 
     Ok(())
 }
@@ -346,19 +357,39 @@ async fn connected_peer_always_has_a_multiplexer() -> TestResult {
     let b_peer = PeerId::from(b_signer.verifying_key());
 
     // Before connecting: neither map has the peer.
-    assert_eq!(a.connection_count(&b_peer).await, 0);
-    assert_eq!(a.mux_count(&b_peer).await, 0);
+    assert_eq!(
+        a.connection_count(&Session::new(b_peer, TEST_LOCAL)).await,
+        0
+    );
+    assert_eq!(a.mux_count(&Session::new(b_peer, TEST_LOCAL)).await, 0);
 
     let (_t_a, _t_b) = connect_pair(&a, &a_signer, &b, &b_signer).await?;
 
     // After connecting: exactly one connection and one mux, in lockstep.
-    assert_eq!(a.connection_count(&b_peer).await, 1, "one connection");
-    assert_eq!(a.mux_count(&b_peer).await, 1, "one mux for the connection");
+    assert_eq!(
+        a.connection_count(&Session::new(b_peer, TEST_LOCAL)).await,
+        1,
+        "one connection"
+    );
+    assert_eq!(
+        a.mux_count(&Session::new(b_peer, TEST_LOCAL)).await,
+        1,
+        "one mux for the connection"
+    );
 
     // After teardown: both gone.
-    a.disconnect_from_peer(&b_peer).await?;
-    assert_eq!(a.connection_count(&b_peer).await, 0, "connection removed");
-    assert_eq!(a.mux_count(&b_peer).await, 0, "mux removed in lockstep");
+    a.disconnect_from_peer(&Session::new(b_peer, TEST_LOCAL))
+        .await?;
+    assert_eq!(
+        a.connection_count(&Session::new(b_peer, TEST_LOCAL)).await,
+        0,
+        "connection removed"
+    );
+    assert_eq!(
+        a.mux_count(&Session::new(b_peer, TEST_LOCAL)).await,
+        0,
+        "mux removed in lockstep"
+    );
 
     Ok(())
 }
@@ -407,17 +438,22 @@ async fn reconnect_during_remove_connection_never_clobbers_mux() -> TestResult {
         // have a mux (else `sync_with_peer`'s `.expect()` would panic).
         // The reconnect race must never leave the fresh mux clobbered.
         assert!(
-            a.conn_mux_invariant_holds(&b_peer).await,
+            a.conn_mux_invariant_holds(&Session::new(b_peer, TEST_LOCAL))
+                .await,
             "iteration {i}: connections⟹multiplexers invariant violated after \
              add/remove race ({} conns, {} muxes) — reconnect race clobbered the mux",
-            a.connection_count(&b_peer).await,
-            a.mux_count(&b_peer).await,
+            a.connection_count(&Session::new(b_peer, TEST_LOCAL)).await,
+            a.mux_count(&Session::new(b_peer, TEST_LOCAL)).await,
         );
 
         // Clean up for the next iteration.
-        a.disconnect_from_peer(&b_peer).await?;
-        assert_eq!(a.connection_count(&b_peer).await, 0);
-        assert_eq!(a.mux_count(&b_peer).await, 0);
+        a.disconnect_from_peer(&Session::new(b_peer, TEST_LOCAL))
+            .await?;
+        assert_eq!(
+            a.connection_count(&Session::new(b_peer, TEST_LOCAL)).await,
+            0
+        );
+        assert_eq!(a.mux_count(&Session::new(b_peer, TEST_LOCAL)).await, 0);
     }
 
     Ok(())
@@ -446,20 +482,25 @@ async fn reconnect_during_disconnect_from_peer_never_clobbers_mux() -> TestResul
         let a1 = a.clone();
         let a2 = a.clone();
         let add = tokio::spawn(async move { a1.add_connection(new_conn).await });
-        let disc = tokio::spawn(async move { a2.disconnect_from_peer(&b_peer).await });
+        let disc = tokio::spawn(async move {
+            a2.disconnect_from_peer(&Session::new(b_peer, TEST_LOCAL))
+                .await
+        });
         let _ = add.await.expect("add task panicked");
         let _ = disc.await.expect("disconnect task panicked");
 
         assert!(
-            a.conn_mux_invariant_holds(&b_peer).await,
+            a.conn_mux_invariant_holds(&Session::new(b_peer, TEST_LOCAL))
+                .await,
             "iteration {i}: connections⟹multiplexers invariant violated after \
              add/disconnect race ({} conns, {} muxes)",
-            a.connection_count(&b_peer).await,
-            a.mux_count(&b_peer).await,
+            a.connection_count(&Session::new(b_peer, TEST_LOCAL)).await,
+            a.mux_count(&Session::new(b_peer, TEST_LOCAL)).await,
         );
 
-        a.disconnect_from_peer(&b_peer).await?;
-        assert_eq!(a.mux_count(&b_peer).await, 0);
+        a.disconnect_from_peer(&Session::new(b_peer, TEST_LOCAL))
+            .await?;
+        assert_eq!(a.mux_count(&Session::new(b_peer, TEST_LOCAL)).await, 0);
     }
 
     Ok(())
@@ -571,7 +612,7 @@ async fn disconnect_all_cancels_in_flight_sync_for_every_peer() -> TestResult {
 
     // Every peer present in the snapshot must report ResponseDropped.
     for peer in [b_peer, c_peer] {
-        if let Some((success, _stats, conn_errs)) = map.get(&peer) {
+        if let Some((success, _stats, conn_errs)) = map.get(&Session::new(peer, TEST_LOCAL)) {
             assert!(!success, "peer {peer:?} should not have succeeded");
             assert!(
                 matches!(
@@ -585,10 +626,16 @@ async fn disconnect_all_cancels_in_flight_sync_for_every_peer() -> TestResult {
     }
 
     // Both maps emptied.
-    assert_eq!(a.connection_count(&b_peer).await, 0);
-    assert_eq!(a.connection_count(&c_peer).await, 0);
-    assert_eq!(a.mux_count(&b_peer).await, 0);
-    assert_eq!(a.mux_count(&c_peer).await, 0);
+    assert_eq!(
+        a.connection_count(&Session::new(b_peer, TEST_LOCAL)).await,
+        0
+    );
+    assert_eq!(
+        a.connection_count(&Session::new(c_peer, TEST_LOCAL)).await,
+        0
+    );
+    assert_eq!(a.mux_count(&Session::new(b_peer, TEST_LOCAL)).await, 0);
+    assert_eq!(a.mux_count(&Session::new(c_peer, TEST_LOCAL)).await, 0);
 
     Ok(())
 }
@@ -619,7 +666,11 @@ async fn remove_non_last_connection_does_not_cancel_pending_calls() -> TestResul
         Authenticated::new_for_test(MessageTransport::new(t_a2), b_peer, Direction::Dialed);
     a.add_connection(conn_a2.clone()).await?;
 
-    assert_eq!(a.connection_count(&b_peer).await, 2, "two connections");
+    assert_eq!(
+        a.connection_count(&Session::new(b_peer, TEST_LOCAL)).await,
+        2,
+        "two connections"
+    );
     tokio::time::sleep(Duration::from_millis(20)).await;
     t_b.pause();
 
@@ -641,12 +692,13 @@ async fn remove_non_last_connection_does_not_cancel_pending_calls() -> TestResul
     // load-bearing invariant must still hold: it still has a multiplexer
     // and `sync_with_peer` would not panic.
     assert_eq!(
-        a.connection_count(&b_peer).await,
+        a.connection_count(&Session::new(b_peer, TEST_LOCAL)).await,
         1,
         "one connection should remain after removing the non-last one"
     );
     assert!(
-        a.conn_mux_invariant_holds(&b_peer).await,
+        a.conn_mux_invariant_holds(&Session::new(b_peer, TEST_LOCAL))
+            .await,
         "a still-connected peer must still satisfy connections⟹multiplexers"
     );
 
@@ -799,7 +851,11 @@ async fn dropping_full_sync_aborts_spawned_per_document_tasks() -> TestResult {
     let a_clone = Arc::clone(&a);
     let sync_handle = tokio::spawn(async move {
         a_clone
-            .full_sync_with_peer(&b_peer, true, LONG_PER_CALL_TIMEOUT)
+            .full_sync_with_peer(
+                &Session::new(b_peer, TEST_LOCAL),
+                true,
+                LONG_PER_CALL_TIMEOUT,
+            )
             .await;
     });
 
@@ -874,7 +930,8 @@ async fn uncapped_sync_stays_pending_then_resolves_on_disconnect() -> TestResult
 
     // Disconnect: the dropped mux sender must resolve the uncapped call.
     let b_peer = PeerId::from(b_signer.verifying_key());
-    a.disconnect_from_peer(&b_peer).await?;
+    a.disconnect_from_peer(&Session::new(b_peer, TEST_LOCAL))
+        .await?;
 
     let result = tokio::time::timeout(BOUND, sync_handle).await;
     assert!(
@@ -885,7 +942,7 @@ async fn uncapped_sync_stays_pending_then_resolves_on_disconnect() -> TestResult
     let result = result.expect("join error").expect("task panicked")?;
 
     let (success, _stats, conn_errs) = result
-        .get(&b_peer)
+        .get(&Session::new(b_peer, TEST_LOCAL))
         .expect("wedged peer must be present in the result map");
     assert!(!success, "peer should not have succeeded");
     assert!(

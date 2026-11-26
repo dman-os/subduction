@@ -112,6 +112,7 @@ pub type NodePolicy = SubductionKeyhive<
     keyhive_core::listener::no_listener::NoListener,
     rand::rngs::OsRng,
     RuntimeKeyline,
+    keyhive_core::store::memory::MemoryKeyhiveStore<crate::change_id::ChangeId>,
 >;
 
 /// The keyhive protocol a node runs.

@@ -9,7 +9,7 @@ use futures::{FutureExt, future::LocalBoxFuture};
 use keyhive_content::store::memory::MemoryCiphertextStore;
 use keyhive_core::{
     content::heads::ContentHeads, keyhive::Keyhive, listener::no_listener::NoListener,
-    principal::group::id::GroupId,
+    principal::group::id::GroupId, store::memory::MemoryKeyhiveStore,
 };
 use keyhive_crypto::{identifier::Identifier, signer::memory::MemorySigner};
 use keyline::power::Power;
@@ -40,6 +40,7 @@ pub type SimpleKeyhive = Keyhive<
     NoListener,
     OsRng,
     TestKeyline,
+    MemoryKeyhiveStore<[u8; 32]>,
 >;
 
 /// An in-memory connection using async channels for testing.
@@ -103,6 +104,12 @@ impl KeyhiveConnection<Local> for ChannelConnection {
 
 /// Create a simple keyhive instance for testing.
 pub async fn make_keyhive() -> SimpleKeyhive {
+    make_keyhive_over(MemoryKeyhiveStore::default()).await
+}
+
+/// [`make_keyhive`] over `store`, a handle the caller keeps to put into the
+/// store what the keyhive should find there when it hydrates.
+pub async fn make_keyhive_over(store: MemoryKeyhiveStore<[u8; 32]>) -> SimpleKeyhive {
     let mut csprng = OsRng;
     let sk = MemorySigner::generate(&mut csprng);
     Keyhive::generate(
@@ -110,6 +117,7 @@ pub async fn make_keyhive() -> SimpleKeyhive {
         MemoryCiphertextStore::new(),
         NoListener,
         TestKeyline::new(),
+        store,
         csprng,
     )
     .await

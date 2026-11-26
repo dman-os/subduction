@@ -481,8 +481,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 [[package]]
 name = "beekem"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7072cc482818ceb73b5b29452ff9d58b809feb8f294e468f84c1110f9989d7d2"
+source = "git+https://github.com/dman-os/keyhive?rev=df93fc4c046ad86a01a4abe591f1b9f14628a4c8#df93fc4c046ad86a01a4abe591f1b9f14628a4c8"
 dependencies = [
  "blake3",
  "chacha20poly1305",
@@ -2883,8 +2882,7 @@ dependencies = [
 [[package]]
 name = "keyhive_codec"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "88bb801be05f13783d02b1814e4b3ec6e72daf7a8b8fd8dd71c26f646acd4403"
+source = "git+https://github.com/dman-os/keyhive?rev=df93fc4c046ad86a01a4abe591f1b9f14628a4c8#df93fc4c046ad86a01a4abe591f1b9f14628a4c8"
 dependencies = [
  "bijoux",
  "thiserror 2.0.20",
@@ -2893,8 +2891,7 @@ dependencies = [
 [[package]]
 name = "keyhive_content"
 version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc25299f0911d9d1b7d9e3abb9b909ea905fc54877205210395fe873816cfac1"
+source = "git+https://github.com/dman-os/keyhive?rev=df93fc4c046ad86a01a4abe591f1b9f14628a4c8#df93fc4c046ad86a01a4abe591f1b9f14628a4c8"
 dependencies = [
  "blake3",
  "chacha20poly1305",
@@ -2911,8 +2908,7 @@ dependencies = [
 [[package]]
 name = "keyhive_core"
 version = "0.12.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "18cf5c5abcd3606a739388fa4a5115918a0b29b0e576b22b29277f5fbe5fef52"
+source = "git+https://github.com/dman-os/keyhive?rev=df93fc4c046ad86a01a4abe591f1b9f14628a4c8#df93fc4c046ad86a01a4abe591f1b9f14628a4c8"
 dependencies = [
  "async-lock",
  "beekem",
@@ -2940,8 +2936,7 @@ dependencies = [
 [[package]]
 name = "keyhive_crypto"
 version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b8199171b69cd29ebba2e8aa693aee0cd537849d7fd232231b4011811e76415"
+source = "git+https://github.com/dman-os/keyhive?rev=df93fc4c046ad86a01a4abe591f1b9f14628a4c8#df93fc4c046ad86a01a4abe591f1b9f14628a4c8"
 dependencies = [
  "blake3",
  "chacha20 0.9.1",
@@ -2965,8 +2960,7 @@ dependencies = [
 [[package]]
 name = "keyline"
 version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "95b3bbe4dcec19ca9e5cf858b0d13c6a174ca84059dfc1146791e6cb8d143476"
+source = "git+https://github.com/dman-os/keyhive?rev=df93fc4c046ad86a01a4abe591f1b9f14628a4c8#df93fc4c046ad86a01a4abe591f1b9f14628a4c8"
 dependencies = [
  "bijoux",
  "ed25519-dalek 2.2.0",
@@ -2980,8 +2974,7 @@ dependencies = [
 [[package]]
 name = "keyline_memory"
 version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "90e41b34e154407341f207983feeb1997e2a4e1cd50c71a7e5f0caa933163596"
+source = "git+https://github.com/dman-os/keyhive?rev=df93fc4c046ad86a01a4abe591f1b9f14628a4c8#df93fc4c046ad86a01a4abe591f1b9f14628a4c8"
 dependencies = [
  "async-lock",
  "future_form",

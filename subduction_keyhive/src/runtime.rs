@@ -5,7 +5,7 @@ use alloc::{format, vec::Vec};
 use keyhive_content::store::memory::MemoryCiphertextStore;
 use keyhive_core::{
     contact_card::ContactCard, content::heads::ContentHeads, keyhive::Keyhive,
-    listener::no_listener::NoListener,
+    listener::no_listener::NoListener, store::memory::MemoryKeyhiveStore,
 };
 use keyhive_crypto::{identifier::Identifier, signer::memory::MemorySigner};
 use keyline_memory::MemoryKeyline;
@@ -27,6 +27,7 @@ pub type SendableRuntimeKeyhive = Keyhive<
     NoListener,
     OsRng,
     RuntimeKeyline,
+    MemoryKeyhiveStore<ChangeId>,
 >;
 
 /// Initialize a `Sendable` keyhive instance.
@@ -42,6 +43,7 @@ pub async fn init_sendable_keyhive(
         MemoryCiphertextStore::<ChangeId, Vec<u8>>::new(),
         NoListener,
         RuntimeKeyline::new(),
+        MemoryKeyhiveStore::default(),
         OsRng,
     )
     .await

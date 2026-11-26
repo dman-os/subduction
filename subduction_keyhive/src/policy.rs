@@ -54,6 +54,7 @@ use keyhive_content::{
 use keyhive_core::{
     certificate::KeylineStorageError, content::heads::ContentHeads, keyhive::Keyhive,
     listener::membership::MembershipListener, principal::document::id::DocumentId,
+    store::KeyhiveStore,
 };
 use keyhive_crypto::{
     identifier::{Identifier, InvalidIdentifier},
@@ -91,7 +92,8 @@ pub struct SubductionKeyhive<
     L: MembershipListener<F, T>,
     R: rand::CryptoRng + rand::RngCore,
     K: Keyline<F, RetentionWatermark = ContentHeads<T>>,
->(Keyhive<F, S, T, P, C, L, R, K>);
+    H: KeyhiveStore<F, T>,
+>(Keyhive<F, S, T, P, C, L, R, K, H>);
 
 impl<
     F: FutureForm,
@@ -102,17 +104,18 @@ impl<
     L: MembershipListener<F, T>,
     R: rand::CryptoRng + rand::RngCore,
     K: Keyline<F, RetentionWatermark = ContentHeads<T>>,
-> SubductionKeyhive<F, S, T, P, C, L, R, K>
+    H: KeyhiveStore<F, T>,
+> SubductionKeyhive<F, S, T, P, C, L, R, K, H>
 {
     /// Create a new [`SubductionKeyhive`] from a [`Keyhive`].
     #[must_use]
-    pub const fn new(keyhive: Keyhive<F, S, T, P, C, L, R, K>) -> Self {
+    pub const fn new(keyhive: Keyhive<F, S, T, P, C, L, R, K, H>) -> Self {
         Self(keyhive)
     }
 
     /// Get a reference to the inner [`Keyhive`].
     #[must_use]
-    pub const fn keyhive(&self) -> &Keyhive<F, S, T, P, C, L, R, K> {
+    pub const fn keyhive(&self) -> &Keyhive<F, S, T, P, C, L, R, K, H> {
         &self.0
     }
 }
@@ -126,9 +129,10 @@ impl<
     L: MembershipListener<F, T>,
     R: rand::CryptoRng + rand::RngCore,
     K: Keyline<F, RetentionWatermark = ContentHeads<T>>,
-> From<Keyhive<F, S, T, P, C, L, R, K>> for SubductionKeyhive<F, S, T, P, C, L, R, K>
+    H: KeyhiveStore<F, T>,
+> From<Keyhive<F, S, T, P, C, L, R, K, H>> for SubductionKeyhive<F, S, T, P, C, L, R, K, H>
 {
-    fn from(keyhive: Keyhive<F, S, T, P, C, L, R, K>) -> Self {
+    fn from(keyhive: Keyhive<F, S, T, P, C, L, R, K, H>) -> Self {
         SubductionKeyhive(keyhive)
     }
 }
@@ -142,9 +146,10 @@ impl<
     L: MembershipListener<F, T>,
     R: rand::CryptoRng + rand::RngCore,
     K: Keyline<F, RetentionWatermark = ContentHeads<T>>,
-> From<SubductionKeyhive<F, S, T, P, C, L, R, K>> for Keyhive<F, S, T, P, C, L, R, K>
+    H: KeyhiveStore<F, T>,
+> From<SubductionKeyhive<F, S, T, P, C, L, R, K, H>> for Keyhive<F, S, T, P, C, L, R, K, H>
 {
-    fn from(subduction_keyhive: SubductionKeyhive<F, S, T, P, C, L, R, K>) -> Self {
+    fn from(subduction_keyhive: SubductionKeyhive<F, S, T, P, C, L, R, K, H>) -> Self {
         subduction_keyhive.0
     }
 }
@@ -157,7 +162,8 @@ impl<
     L: MembershipListener<Sendable, T> + Send + Sync,
     R: rand::CryptoRng + rand::RngCore + Send + Sync,
     K: Keyline<Sendable, RetentionWatermark = ContentHeads<T>> + Send + Sync,
-> ConnectionPolicy<Sendable> for SubductionKeyhive<Sendable, S, T, P, C, L, R, K>
+    H: KeyhiveStore<Sendable, T> + Send + Sync,
+> ConnectionPolicy<Sendable> for SubductionKeyhive<Sendable, S, T, P, C, L, R, K, H>
 {
     type ConnectionDisallowed = InvalidIdentifier;
 
@@ -177,7 +183,8 @@ impl<
     L: MembershipListener<Sendable, T> + Send + Sync,
     R: rand::CryptoRng + rand::RngCore + Send + Sync,
     K: Keyline<Sendable, RetentionWatermark = ContentHeads<T>> + Send + Sync,
-> StoragePolicy<Sendable> for SubductionKeyhive<Sendable, S, T, P, C, L, R, K>
+    H: KeyhiveStore<Sendable, T> + Send + Sync,
+> StoragePolicy<Sendable> for SubductionKeyhive<Sendable, S, T, P, C, L, R, K, H>
 where
     K::Error: Send + Sync + 'static,
 {
@@ -223,7 +230,8 @@ impl<
     L: MembershipListener<Local, T>,
     R: rand::CryptoRng + rand::RngCore,
     K: Keyline<Local, RetentionWatermark = ContentHeads<T>>,
-> ConnectionPolicy<Local> for SubductionKeyhive<Local, S, T, P, C, L, R, K>
+    H: KeyhiveStore<Local, T>,
+> ConnectionPolicy<Local> for SubductionKeyhive<Local, S, T, P, C, L, R, K, H>
 {
     type ConnectionDisallowed = InvalidIdentifier;
 
@@ -243,7 +251,8 @@ impl<
     L: MembershipListener<Local, T>,
     R: rand::CryptoRng + rand::RngCore,
     K: Keyline<Local, RetentionWatermark = ContentHeads<T>>,
-> StoragePolicy<Local> for SubductionKeyhive<Local, S, T, P, C, L, R, K>
+    H: KeyhiveStore<Local, T>,
+> StoragePolicy<Local> for SubductionKeyhive<Local, S, T, P, C, L, R, K, H>
 where
     K::Error: Send + Sync + 'static,
 {
@@ -288,8 +297,8 @@ where
 /// Returns [`InvalidIdentifier`] if `peer_id` is not
 /// a valid identifier.
 #[allow(clippy::unused_async)]
-pub async fn authorize_connect_with<F, S, T, P, C, L, R, K>(
-    _keyhive: &Keyhive<F, S, T, P, C, L, R, K>,
+pub async fn authorize_connect_with<F, S, T, P, C, L, R, K, H>(
+    _keyhive: &Keyhive<F, S, T, P, C, L, R, K, H>,
     peer_id: PeerId,
 ) -> Result<(), InvalidIdentifier>
 where
@@ -301,6 +310,7 @@ where
     L: MembershipListener<F, T>,
     R: rand::CryptoRng + rand::RngCore,
     K: Keyline<F, RetentionWatermark = ContentHeads<T>>,
+    H: KeyhiveStore<F, T>,
 {
     peer_identifier(peer_id).map(|_| ())
 }
@@ -312,8 +322,8 @@ where
 ///
 /// Returns [`FetchDisallowedError`] for invalid IDs, too little power, or a
 /// failed membership query.
-pub async fn authorize_fetch_with<F, S, T, P, C, L, R, K>(
-    keyhive: &Keyhive<F, S, T, P, C, L, R, K>,
+pub async fn authorize_fetch_with<F, S, T, P, C, L, R, K, H>(
+    keyhive: &Keyhive<F, S, T, P, C, L, R, K, H>,
     peer: PeerId,
     sedimentree_id: SedimentreeId,
 ) -> Result<(), FetchDisallowedError<AccessError<F, K>>>
@@ -326,6 +336,7 @@ where
     L: MembershipListener<F, T>,
     R: rand::CryptoRng + rand::RngCore,
     K: Keyline<F, RetentionWatermark = ContentHeads<T>>,
+    H: KeyhiveStore<F, T>,
     K::Error: Send + Sync + 'static,
 {
     let peer = peer_identifier(peer).map_err(FetchDisallowedError::InvalidPeerId)?;
@@ -333,8 +344,8 @@ where
 }
 
 /// [`authorize_fetch_with`] for a peer already parsed as an [`Identifier`].
-async fn authorize_fetch_by<F, S, T, P, C, L, R, K>(
-    keyhive: &Keyhive<F, S, T, P, C, L, R, K>,
+async fn authorize_fetch_by<F, S, T, P, C, L, R, K, H>(
+    keyhive: &Keyhive<F, S, T, P, C, L, R, K, H>,
     peer: Identifier,
     sedimentree_id: SedimentreeId,
 ) -> Result<(), FetchDisallowedError<AccessError<F, K>>>
@@ -347,6 +358,7 @@ where
     L: MembershipListener<F, T>,
     R: rand::CryptoRng + rand::RngCore,
     K: Keyline<F, RetentionWatermark = ContentHeads<T>>,
+    H: KeyhiveStore<F, T>,
     K::Error: Send + Sync + 'static,
 {
     let doc = sedimentree_identifier(sedimentree_id)
@@ -366,8 +378,8 @@ where
 ///
 /// Returns [`PutDisallowedError`] for invalid IDs, too little power, or a
 /// failed membership query.
-pub async fn authorize_put_with<F, S, T, P, C, L, R, K>(
-    keyhive: &Keyhive<F, S, T, P, C, L, R, K>,
+pub async fn authorize_put_with<F, S, T, P, C, L, R, K, H>(
+    keyhive: &Keyhive<F, S, T, P, C, L, R, K, H>,
     requestor: PeerId,
     _author: VerifiedAuthor,
     sedimentree_id: SedimentreeId,
@@ -381,6 +393,7 @@ where
     L: MembershipListener<F, T>,
     R: rand::CryptoRng + rand::RngCore,
     K: Keyline<F, RetentionWatermark = ContentHeads<T>>,
+    H: KeyhiveStore<F, T>,
     K::Error: Send + Sync + 'static,
 {
     let requestor = peer_identifier(requestor).map_err(PutDisallowedError::InvalidRequestorId)?;
@@ -395,8 +408,8 @@ where
 
 /// The subset of `ids` that `peer` may fetch, in order. A failed membership
 /// query denies that ID and is logged.
-pub async fn filter_authorized_fetch_with<F, S, T, P, C, L, R, K>(
-    keyhive: &Keyhive<F, S, T, P, C, L, R, K>,
+pub async fn filter_authorized_fetch_with<F, S, T, P, C, L, R, K, H>(
+    keyhive: &Keyhive<F, S, T, P, C, L, R, K, H>,
     peer: PeerId,
     ids: Vec<SedimentreeId>,
 ) -> Vec<SedimentreeId>
@@ -409,6 +422,7 @@ where
     L: MembershipListener<F, T>,
     R: rand::CryptoRng + rand::RngCore,
     K: Keyline<F, RetentionWatermark = ContentHeads<T>>,
+    H: KeyhiveStore<F, T>,
     K::Error: Send + Sync + 'static,
 {
     // A peer that isn't a valid identifier is authorized for nothing; parse
@@ -434,8 +448,11 @@ where
 }
 
 /// `who`'s effective power over `doc`, or `None` for no access.
-async fn access<F, S, T, P, C, L, R, K>(
-    keyhive: &Keyhive<F, S, T, P, C, L, R, K>,
+///
+/// Membership is Keyline's: the answer does not read the document's CGKA group, so
+/// the document need not be hydrated, and an unloaded document is not "absent" here.
+async fn access<F, S, T, P, C, L, R, K, H>(
+    keyhive: &Keyhive<F, S, T, P, C, L, R, K, H>,
     who: Identifier,
     doc: Identifier,
 ) -> Result<Option<Power>, AccessError<F, K>>
@@ -448,6 +465,7 @@ where
     L: MembershipListener<F, T>,
     R: rand::CryptoRng + rand::RngCore,
     K: Keyline<F, RetentionWatermark = ContentHeads<T>>,
+    H: KeyhiveStore<F, T>,
     K::Error: Send + Sync + 'static,
 {
     keyhive.access_for_doc(who, DocumentId::from(doc)).await

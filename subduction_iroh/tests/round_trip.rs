@@ -30,7 +30,7 @@ use subduction_core::{
     handler::sync::SyncHandler,
     handshake::audience::{Audience, DiscoveryId},
     nonce_cache::NonceCache,
-    peer::id::PeerId,
+    peer::{id::PeerId, session::Session},
     policy::open::OpenPolicy,
     storage::memory::MemoryStorage,
     subduction::{Subduction, builder::SubductionBuilder},
@@ -38,7 +38,7 @@ use subduction_core::{
     transport::message::MessageTransport,
 };
 use subduction_crypto::signer::memory::MemorySigner;
-use subduction_iroh::transport::IrohTransport;
+use subduction_iroh::{SessionPrincipal, transport::IrohTransport};
 use subduction_websocket::timeout::FuturesTimerTimeout;
 use testresult::TestResult;
 
@@ -73,6 +73,12 @@ fn init_tracing() {
 
 fn signer(seed: u8) -> MemorySigner {
     MemorySigner::from_bytes(&[seed; 32])
+}
+
+/// The endpoint key of the node whose signer is `signer(seed)`: a node's own
+/// principal is its endpoint's key.
+fn node_key(seed: u8) -> iroh::SecretKey {
+    iroh::SecretKey::from_bytes(&[seed; 32])
 }
 
 fn random_commit_id() -> CommitId {
@@ -125,6 +131,7 @@ impl TestServer {
         let subduction = spawn_subduction(&sig, None);
 
         let endpoint = iroh::Endpoint::builder(presets::Minimal)
+            .secret_key(node_key(seed))
             .alpns(vec![subduction_iroh::ALPN.to_vec()])
             .bind()
             .await
@@ -140,6 +147,7 @@ impl TestServer {
                 match subduction_iroh::server::accept_one(
                     &accept_ep,
                     &accept_signer,
+                    SessionPrincipal::Node,
                     &nonce_cache,
                     peer_id,
                     None,
@@ -187,6 +195,7 @@ impl TestClient {
         let subduction = spawn_subduction(&sig, None);
 
         let client_ep = iroh::Endpoint::builder(presets::Minimal)
+            .secret_key(node_key(seed))
             .bind()
             .await
             .expect("bind iroh client endpoint");
@@ -197,6 +206,7 @@ impl TestClient {
             &client_ep,
             server_addr,
             &sig,
+            SessionPrincipal::Node,
             Audience::known(server.peer_id),
         )
         .await
@@ -236,6 +246,7 @@ impl TestServerDiscover {
         let subduction = spawn_subduction(&sig, Some(discovery_id));
 
         let endpoint = iroh::Endpoint::builder(presets::Minimal)
+            .secret_key(node_key(seed))
             .alpns(vec![subduction_iroh::ALPN.to_vec()])
             .bind()
             .await
@@ -250,6 +261,7 @@ impl TestServerDiscover {
                 match subduction_iroh::server::accept_one(
                     &accept_ep,
                     &accept_signer,
+                    SessionPrincipal::Node,
                     &nonce_cache,
                     peer_id,
                     discovery_audience,
@@ -290,6 +302,7 @@ impl TestClient {
         let subduction = spawn_subduction(&sig, None);
 
         let client_ep = iroh::Endpoint::builder(presets::Minimal)
+            .secret_key(node_key(seed))
             .bind()
             .await
             .expect("bind iroh client endpoint");
@@ -300,6 +313,7 @@ impl TestClient {
             &client_ep,
             server_addr,
             &sig,
+            SessionPrincipal::Node,
             Audience::discover(service_name.as_bytes()),
         )
         .await
@@ -812,6 +826,7 @@ async fn discovery_wrong_service_name_rejected() -> TestResult {
         &client_ep,
         server_addr,
         &sig,
+        SessionPrincipal::Shared,
         Audience::discover(b"service-beta"), // wrong service name
     )
     .await;
@@ -1006,6 +1021,7 @@ async fn endpoint_shutdown_stops_accept() -> TestResult {
     let subduction = spawn_subduction(&sig, None);
 
     let endpoint = iroh::Endpoint::builder(presets::Minimal)
+        .secret_key(node_key(120))
         .alpns(vec![subduction_iroh::ALPN.to_vec()])
         .bind()
         .await
@@ -1022,6 +1038,7 @@ async fn endpoint_shutdown_stops_accept() -> TestResult {
         while let Ok(result) = subduction_iroh::server::accept_one(
             &accept_ep,
             &accept_signer,
+            SessionPrincipal::Node,
             &nonce_cache,
             peer_id,
             None,
@@ -1043,6 +1060,7 @@ async fn endpoint_shutdown_stops_accept() -> TestResult {
     // Try to connect — should fail
     let client_sig = signer(121);
     let client_ep = iroh::Endpoint::builder(presets::Minimal)
+        .secret_key(node_key(121))
         .bind()
         .await
         .expect("bind client endpoint");
@@ -1051,6 +1069,7 @@ async fn endpoint_shutdown_stops_accept() -> TestResult {
         &client_ep,
         server_addr,
         &client_sig,
+        SessionPrincipal::Node,
         Audience::known(peer_id),
     )
     .await;
@@ -1060,5 +1079,304 @@ async fn endpoint_shutdown_stops_accept() -> TestResult {
         "should not be able to connect to a shut-down endpoint"
     );
 
+    Ok(())
+}
+
+// ─── Sessions: one endpoint pair, several principals ─────────────────────────
+
+/// A server policy that authorizes a fetch by the principal that signed the
+/// session: each principal may fetch only the tree it was granted.
+struct GrantPolicy {
+    grants: Vec<(PeerId, SedimentreeId)>,
+}
+
+#[derive(Debug)]
+struct NotGranted;
+impl std::fmt::Display for NotGranted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("not granted")
+    }
+}
+impl std::error::Error for NotGranted {}
+
+impl subduction_core::policy::connection::ConnectionPolicy<Sendable> for GrantPolicy {
+    type ConnectionDisallowed = std::convert::Infallible;
+    fn authorize_connect(
+        &self,
+        _: PeerId,
+    ) -> futures::future::BoxFuture<'_, Result<(), Self::ConnectionDisallowed>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+impl subduction_core::policy::storage::StoragePolicy<Sendable> for GrantPolicy {
+    type FetchDisallowed = NotGranted;
+    type PutDisallowed = std::convert::Infallible;
+    fn authorize_fetch(
+        &self,
+        peer: PeerId,
+        id: SedimentreeId,
+    ) -> futures::future::BoxFuture<'_, Result<(), NotGranted>> {
+        let granted = self.grants.contains(&(peer, id));
+        Box::pin(async move { granted.then_some(()).ok_or(NotGranted) })
+    }
+    fn authorize_put(
+        &self,
+        _: PeerId,
+        _: subduction_crypto::verified_author::VerifiedAuthor,
+        _: SedimentreeId,
+    ) -> futures::future::BoxFuture<'_, Result<(), Self::PutDisallowed>> {
+        Box::pin(async { Ok(()) })
+    }
+    fn filter_authorized_fetch(
+        &self,
+        peer: PeerId,
+        ids: Vec<SedimentreeId>,
+    ) -> futures::future::BoxFuture<'_, Vec<SedimentreeId>> {
+        let granted: Vec<_> = ids
+            .into_iter()
+            .filter(|id| self.grants.contains(&(peer, *id)))
+            .collect();
+        Box::pin(async move { granted })
+    }
+}
+
+type GrantCfg = Config<MemoryStorage, GrantPolicy, MemorySigner, FuturesTimerTimeout, TokioSpawn>;
+type GrantSubduction = Arc<
+    Subduction<
+        'static,
+        Sendable,
+        GrantCfg,
+        MessageTransport<IrohTransport>,
+        SyncHandler<Sendable, GrantCfg, MessageTransport<IrohTransport>, CountLeadingZeroBytes>,
+        CountLeadingZeroBytes,
+    >,
+>;
+
+async fn store_one(node: &GrantSubduction, id: SedimentreeId, seed: u8) -> TestResult {
+    node.store_commit(
+        id,
+        CommitId::new([seed; 32]),
+        BTreeSet::new(),
+        Blob::new(vec![seed; 16]),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Two QUIC connections between one iroh endpoint pair, signed by different
+/// local principals (the node's own and a shared one), are two sessions: the
+/// server authorizes each by its own principal's grants, the client addresses
+/// each by name and can never fall back to the other, and closing one leaves
+/// the other open.
+#[tokio::test]
+async fn sessions_of_different_principals_run_side_by_side() -> TestResult {
+    init_tracing();
+
+    let server_sig = signer(140);
+    let server_id = PeerId::from(server_sig.verifying_key());
+    let node_sig = signer(141);
+    let node_id = PeerId::from(node_sig.verifying_key());
+    let shared_sig = signer(150);
+    let shared_id = PeerId::from(shared_sig.verifying_key());
+    let tree_node = SedimentreeId::new([0xA1; 32]);
+    let tree_shared = SedimentreeId::new([0xB2; 32]);
+
+    // The server grants the node principal one tree and the shared principal
+    // the other.
+    let (server, _handler, listener, manager) = SubductionBuilder::new()
+        .signer(server_sig.clone())
+        .storage(
+            MemoryStorage::default(),
+            Arc::new(GrantPolicy {
+                grants: vec![(node_id, tree_node), (shared_id, tree_shared)],
+            }),
+        )
+        .spawner(TokioSpawn)
+        .timer(FuturesTimerTimeout)
+        .build::<Sendable, MessageTransport<IrohTransport>>();
+    tokio::spawn(listener);
+    tokio::spawn(manager);
+    store_one(&server, tree_node, 1).await?;
+    store_one(&server, tree_shared, 2).await?;
+
+    let server_ep = iroh::Endpoint::builder(presets::Minimal)
+        .secret_key(node_key(140))
+        .alpns(vec![subduction_iroh::ALPN.to_vec()])
+        .bind()
+        .await?;
+    let server_addr = server_ep.addr();
+    {
+        let server = server.clone();
+        let ep = server_ep.clone();
+        let nonce_cache = NonceCache::default();
+        tokio::spawn(async move {
+            while let Ok(accepted) = subduction_iroh::server::accept_one(
+                &ep,
+                &server_sig,
+                SessionPrincipal::Node,
+                &nonce_cache,
+                server_id,
+                None,
+                HANDSHAKE_MAX_DRIFT,
+            )
+            .await
+            {
+                tokio::spawn(accepted.listener_task);
+                tokio::spawn(accepted.sender_task);
+                server
+                    .add_connection(accepted.authenticated.map(MessageTransport::new))
+                    .await
+                    .expect("server adds the session");
+            }
+        });
+    }
+
+    // One client endpoint, one Subduction node, two sessions to the server.
+    let client_ep = iroh::Endpoint::builder(presets::Minimal)
+        .secret_key(node_key(141))
+        .bind()
+        .await?;
+    let client = spawn_subduction(&node_sig, None);
+
+    let mut quic = Vec::new();
+    for (sig, principal) in [
+        (&node_sig, SessionPrincipal::Node),
+        (&shared_sig, SessionPrincipal::Shared),
+    ] {
+        let result = subduction_iroh::client::connect(
+            &client_ep,
+            server_addr.clone(),
+            sig,
+            principal,
+            Audience::known(server_id),
+        )
+        .await?;
+        tokio::spawn(result.listener_task);
+        tokio::spawn(result.sender_task);
+        quic.push(result.authenticated.inner().quic_connection().clone());
+        client
+            .add_connection(result.authenticated.map(MessageTransport::new))
+            .await?;
+    }
+    let (quic_node, quic_shared) = (&quic[0], &quic[1]);
+    assert_ne!(
+        quic_node.stable_id(),
+        quic_shared.stable_id(),
+        "each session is its own QUIC connection"
+    );
+
+    let as_node = Session::new(server_id, node_id);
+    let as_shared = Session::new(server_id, shared_id);
+    assert_eq!(
+        client.connected_sessions().await,
+        [as_node, as_shared].into_iter().collect()
+    );
+    assert_eq!(client.connected_peer_ids().await.len(), 1);
+    assert_eq!(client.connection_count(&as_node).await, 1);
+    assert_eq!(client.connection_count(&as_shared).await, 1);
+    // The server sees the same two connections as two sessions of two remotes.
+    assert!(
+        server
+            .connected_sessions()
+            .await
+            .contains(&Session::new(node_id, server_id))
+    );
+    assert!(
+        server
+            .connected_sessions()
+            .await
+            .contains(&Session::new(shared_id, server_id))
+    );
+
+    // Each principal gets exactly what the server granted it, over the session
+    // the caller named, even though the other session reaches the same server.
+    let ask = |session: Session, id| {
+        let client = client.clone();
+        async move {
+            client
+                .sync_with_peer(&session, id, false, REQUEST_TIMEOUT)
+                .await
+                .map(|(success, _, _)| success)
+        }
+    };
+    assert!(ask(as_node, tree_node).await?, "node principal's grant");
+    assert!(!ask(as_node, tree_shared).await?, "not the node's grant");
+    assert!(
+        ask(as_shared, tree_shared).await?,
+        "shared principal's grant"
+    );
+    assert!(!ask(as_shared, tree_node).await?, "not the shared grant");
+    assert_eq!(
+        client.get_commits(tree_node).await.map(|c| c.len()),
+        Some(1)
+    );
+    assert_eq!(
+        client.get_commits(tree_shared).await.map(|c| c.len()),
+        Some(1)
+    );
+
+    // Closing the shared session leaves the node's session open and working.
+    assert!(client.disconnect_from_peer(&as_shared).await?);
+    assert_eq!(client.connection_count(&as_shared).await, 0);
+    assert_eq!(client.connection_count(&as_node).await, 1);
+    assert!(quic_shared.close_reason().is_some());
+    assert!(quic_node.close_reason().is_none());
+    store_one(&server, tree_node, 3).await?;
+    assert!(ask(as_node, tree_node).await?);
+    assert_eq!(
+        client.get_commits(tree_node).await.map(|c| c.len()),
+        Some(2)
+    );
+    assert!(
+        ask(as_shared, tree_shared).await? == false,
+        "the closed session has no connection to send on"
+    );
+    Ok(())
+}
+
+/// The node principal must be the endpoint's key, on both ends, and a shared
+/// principal never is.
+#[tokio::test]
+async fn the_node_principal_must_be_the_endpoint_key() -> TestResult {
+    init_tracing();
+
+    let ep = iroh::Endpoint::builder(presets::Minimal)
+        .secret_key(node_key(160))
+        .alpns(vec![subduction_iroh::ALPN.to_vec()])
+        .bind()
+        .await?;
+    let other = signer(161);
+    let other_id = PeerId::from(other.verifying_key());
+    let endpoint_id = PeerId::new(*ep.id().as_bytes());
+
+    let refused = subduction_iroh::client::connect(
+        &ep,
+        ep.addr(),
+        &other,
+        SessionPrincipal::Node,
+        Audience::known(endpoint_id),
+    )
+    .await;
+    assert!(matches!(
+        refused,
+        Err(subduction_iroh::error::ConnectError::PrincipalNotEndpoint(e))
+            if e.principal == other_id && e.endpoint == endpoint_id
+    ));
+
+    let refused = subduction_iroh::server::accept_one(
+        &ep,
+        &other,
+        SessionPrincipal::Node,
+        &NonceCache::default(),
+        other_id,
+        None,
+        HANDSHAKE_MAX_DRIFT,
+    )
+    .await;
+    assert!(matches!(
+        refused,
+        Err(subduction_iroh::error::AcceptError::PrincipalNotEndpoint(_))
+    ));
     Ok(())
 }

@@ -15,7 +15,7 @@ use subduction_core::{
 use subduction_crypto::{nonce::Nonce, signer::Signer};
 
 use crate::{
-    ALPN,
+    ALPN, SessionPrincipal,
     error::{ConnectError, RunError},
     handshake::IrohHandshake,
     transport::IrohTransport,
@@ -55,8 +55,17 @@ impl core::fmt::Debug for ConnectResult {
 /// Returns a [`ConnectResult`] containing the authenticated connection and
 /// background tasks that must be spawned.
 ///
+/// The session is a new QUIC connection from `endpoint`, so one endpoint can
+/// hold several sessions to the same remote at once, each signed by a
+/// different local principal. A handshake cannot be repeated on a QUIC
+/// connection, and closing a session closes only its own QUIC connection.
+/// The remote's identity stays its endpoint key; `principal` says which local
+/// key signs, and the result's [`Authenticated::session`] records it.
+///
 /// # Errors
 ///
+/// Returns [`ConnectError::PrincipalNotEndpoint`] if `principal` is
+/// [`SessionPrincipal::Node`] and `signer` is not the endpoint's key.
 /// Returns an error if the QUIC connection, stream establishment, or
 /// handshake authentication fails.
 ///
@@ -64,8 +73,7 @@ impl core::fmt::Debug for ConnectResult {
 ///
 /// ```ignore
 /// let result = connect(
-///     &endpoint, addr, Duration::from_secs(30), timeout,
-///     &signer, Audience::known(peer_id),
+///     &endpoint, addr, &signer, SessionPrincipal::Node, Audience::known(peer_id),
 /// ).await?;
 /// tokio::spawn(result.listener_task);
 /// tokio::spawn(result.sender_task);
@@ -75,11 +83,13 @@ pub async fn connect<S>(
     endpoint: &Endpoint,
     addr: EndpointAddr,
     signer: &S,
+    principal: SessionPrincipal,
     audience: Audience,
 ) -> Result<ConnectResult, ConnectError>
 where
     S: Signer<Sendable>,
 {
+    principal.check(endpoint, signer)?;
     let quic_conn: QuicConnection = endpoint.connect(addr, ALPN).await?;
 
     tracing::info!(

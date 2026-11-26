@@ -12,7 +12,10 @@
 //! `Signed<Response>`) over the QUIC bi-directional stream. While iroh
 //! already provides mutual TLS authentication at the transport layer, the
 //! Subduction handshake proves that the peer holds the expected _Subduction_
-//! signing key (which may differ from the iroh node identity).
+//! signing key. Which key may sign is the caller's declaration, a
+//! [`SessionPrincipal`]: the node's own principal must be the endpoint's key,
+//! and anything else is a shared principal, recorded as that principal in the
+//! resulting [`Session`](subduction_core::peer::session::Session).
 //!
 //! # Architecture
 //!
@@ -41,8 +44,7 @@
 //! // Connect to a peer
 //! let ep = Endpoint::bind().await?;
 //! let result = client::connect(
-//!     &ep, addr, Duration::from_secs(30), timeout,
-//!     &signer, Audience::known(peer_id),
+//!     &ep, addr, &signer, SessionPrincipal::Node, Audience::known(peer_id),
 //! ).await?;
 //! tokio::spawn(result.listener_task);
 //! tokio::spawn(result.sender_task);
@@ -61,6 +63,40 @@ pub mod transport;
 
 #[cfg(feature = "server")]
 pub mod server;
+
+/// Which principal an iroh session is signed as.
+///
+/// The remote always sees our endpoint's key as the QUIC peer. The key that
+/// signs the Subduction handshake is separate, and the remote authorizes the
+/// session by it. A shared principal's private key is deliberately held by more
+/// than one party (an invite link, say), so it can never be the endpoint's key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionPrincipal {
+    /// The node's own principal. The signer must be the endpoint's key, which
+    /// the connect and accept functions check before touching the network.
+    Node,
+    /// A principal whose key is shared and is not the endpoint's. Any signer is
+    /// accepted, and the session is recorded as that principal.
+    Shared,
+}
+
+impl SessionPrincipal {
+    pub(crate) fn check<S: subduction_crypto::signer::Signer<future_form::Sendable>>(
+        self,
+        endpoint: &iroh::Endpoint,
+        signer: &S,
+    ) -> Result<(), error::PrincipalNotEndpoint> {
+        let principal = subduction_core::peer::id::PeerId::from(signer.verifying_key());
+        let endpoint = subduction_core::peer::id::PeerId::new(*endpoint.id().as_bytes());
+        if self == Self::Node && principal != endpoint {
+            return Err(error::PrincipalNotEndpoint {
+                principal,
+                endpoint,
+            });
+        }
+        Ok(())
+    }
+}
 
 /// ALPN protocol identifier for Subduction over Iroh.
 ///

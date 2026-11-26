@@ -19,6 +19,7 @@ use subduction_core::{
 use subduction_crypto::signer::Signer;
 
 use crate::{
+    SessionPrincipal,
     client::iroh_peer_id,
     error::{AcceptError, RunError},
     handshake::IrohHandshake,
@@ -56,6 +57,8 @@ impl core::fmt::Debug for AcceptResult {
 ///
 /// # Errors
 ///
+/// Returns [`AcceptError::PrincipalNotEndpoint`] if `principal` is
+/// [`SessionPrincipal::Node`] and `signer` is not the endpoint's key.
 /// Returns an error if no connection arrives (endpoint shutting down),
 /// the TLS handshake / stream acceptance fails, or Subduction handshake
 /// authentication fails.
@@ -66,7 +69,7 @@ impl core::fmt::Debug for AcceptResult {
 /// loop {
 ///     let result = accept_one(
 ///         &endpoint, Duration::from_secs(30), timeout.clone(),
-///         &signer, &nonce_cache, our_peer_id, None, Duration::from_secs(600),
+///         &signer, SessionPrincipal::Node, &nonce_cache, our_peer_id, None, Duration::from_secs(600),
 ///     ).await?;
 ///     tokio::spawn(result.listener_task);
 ///     tokio::spawn(result.sender_task);
@@ -77,6 +80,7 @@ impl core::fmt::Debug for AcceptResult {
 pub async fn accept_one<S>(
     endpoint: &Endpoint,
     signer: &S,
+    principal: SessionPrincipal,
     nonce_cache: &NonceCache,
     our_peer_id: PeerId,
     discovery_audience: Option<Audience>,
@@ -85,6 +89,7 @@ pub async fn accept_one<S>(
 where
     S: Signer<Sendable>,
 {
+    principal.check(endpoint, signer)?;
     let incoming = endpoint.accept().await.ok_or(AcceptError::NoIncoming)?;
 
     let quic_conn = incoming.await?;

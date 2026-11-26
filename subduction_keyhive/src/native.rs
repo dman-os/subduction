@@ -20,7 +20,10 @@ use keyhive_core::{
     event::{Event, static_event::StaticEvent},
     keyhive::{Keyhive, ReceiveStaticEventError},
     listener::membership::MembershipListener,
-    principal::{document::id::DocumentId, individual::{ReceivePrekeyOpError, id::IndividualId}},
+    principal::{
+        document::id::DocumentId,
+        individual::{ReceivePrekeyOpError, id::IndividualId},
+    },
     store::{HydrateError, KeyhiveStore},
 };
 use keyhive_crypto::{
@@ -108,14 +111,10 @@ where
     type Error = NativeKeyhiveError<K::Error>;
 
     fn total_ops(&self) -> F::Future<'_, Result<u64, NativeKeyhiveError<K::Error>>> {
-        F::from_future(async move {
-            // `stats` counts the CGKA operations of the documents in memory, so
-            // an unloaded document would not count: the protocol compares two
-            // counts to see whether an ingest changed anything, and a document
-            // an ingest loads must not read as a change.
-            self.hydrate_all().await?;
-            Ok(Keyhive::stats(self).await.total_ops())
-        })
+        // The protocol compares two counts to see whether an ingest changed
+        // anything, so all it needs is a count that grows with what keyhive
+        // holds, and that does not move when a document is loaded.
+        F::from_future(async move { Ok(Keyhive::total_ops(self).await?) })
     }
 
     fn pending_event_hashes(
@@ -147,10 +146,6 @@ where
         within: Option<&'a BTreeSet<EventHash>>,
     ) -> F::Future<'a, Result<BTreeMap<EventHash, EventBytes>, NativeKeyhiveError<K::Error>>> {
         F::from_future(async move {
-            // Serving reads the CGKA and prekey operations in memory, and keyhive
-            // leaves out what it has not loaded without saying so. Load everything
-            // the store holds first.
-            self.hydrate_all().await?;
             Ok(Keyhive::static_events_for_agent(self, id)
                 .await
                 .map_err(NativeKeyhiveError::from)?
@@ -170,10 +165,6 @@ where
         id: Identifier,
     ) -> F::Future<'_, Result<BTreeSet<EventHash>, NativeKeyhiveError<K::Error>>> {
         F::from_future(async move {
-            // Serving reads the CGKA and prekey operations in memory, and keyhive
-            // leaves out what it has not loaded without saying so. Load everything
-            // the store holds first.
-            self.hydrate_all().await?;
             Ok(Keyhive::static_events_for_agent(self, id)
                 .await
                 .map_err(NativeKeyhiveError::from)?
@@ -188,10 +179,6 @@ where
         skip: &'a BTreeSet<EventHash>,
     ) -> F::Future<'a, Result<AgentEventIndex, NativeKeyhiveError<K::Error>>> {
         F::from_future(async move {
-            // Serving reads the CGKA and prekey operations in memory, and keyhive
-            // leaves out what it has not loaded without saying so. Load everything
-            // the store holds first.
-            self.hydrate_all().await?;
             let all = Keyhive::all_agent_events(self)
                 .await
                 .map_err(NativeKeyhiveError::from)?;
@@ -263,9 +250,25 @@ where
                 })
                 .map(|op| DocumentId::from(op.doc_id))
                 .collect();
-            for doc in docs {
+            // Likewise the documents of events that wait: a CGKA operation for a
+            // document that was not loaded waits as if its predecessors were
+            // missing, and replays only once the document is.
+            let waiting = Keyhive::pending_documents(self).await;
+            for doc in docs.into_iter().chain(waiting) {
                 self.hydrate(doc).await?;
             }
+            // And the individuals whose prekey operations arrive: `total_ops` counts one
+            // that is loaded from memory, which must hold what the store does for the
+            // count not to move when it is loaded.
+            let issuers: Vec<IndividualId> = decoded
+                .iter()
+                .filter_map(|event| match event {
+                    StaticEvent::PrekeysExpanded(op) => Some(IndividualId(op.issuer())),
+                    StaticEvent::PrekeyRotated(op) => Some(IndividualId(op.issuer())),
+                    _ => None,
+                })
+                .collect();
+            self.hydrate_individuals(&issuers).await?;
             let pending = self
                 .ingest_unsorted_static_events(decoded)
                 .await
@@ -331,7 +334,7 @@ where
             };
             // An archive carries operations for any document, and its fields are not
             // readable here to say which, so load every document the store holds before
-            // its operations merge.
+            // its operations merge. This is the one place that genuinely needs them all.
             self.hydrate_all().await?;
             Keyhive::ingest_archive(self, archive)
                 .await
@@ -351,11 +354,11 @@ mod tests {
     use nonempty::nonempty;
     use testresult::TestResult;
 
-    /// Serving a document that is in the store but not in memory loads it: the
-    /// events a peer is sent include the document's CGKA operations, which
-    /// keyhive's own serving would leave out without saying so.
+    /// Serving a document that is in the store but not in memory does not load
+    /// it, and sends the same events as serving it loaded: keyhive reads the
+    /// store's rows.
     #[tokio::test(flavor = "current_thread")]
-    async fn serving_an_unloaded_document_hydrates_it() -> TestResult {
+    async fn serving_an_unloaded_document_does_not_hydrate_it() -> TestResult {
         let store = MemoryKeyhiveStore::<[u8; 32]>::default();
         let keyhive = make_keyhive_over(store.clone()).await;
         let me: Identifier = keyhive.id().into();
@@ -369,30 +372,39 @@ mod tests {
         KeyhiveStore::<Local, [u8; 32]>::append_cgka_ops(&store, doc, &ops).await?;
 
         let served = KeyhiveAccess::<Local>::event_hashes_for_agent(&keyhive, me).await?;
+        let count = KeyhiveAccess::<Local>::total_ops(&keyhive).await?;
 
         keyhive.evict(doc).await;
         assert!(!keyhive.has_document(doc).await);
-        let in_memory: BTreeSet<EventHash> = Keyhive::static_events_for_agent(&keyhive, me)
-            .await?
-            .keys()
-            .map(digest_to_bytes)
-            .collect();
         assert!(
-            in_memory.len() < served.len(),
-            "keyhive serves only what is loaded, so the test would pass without hydrating"
+            keyhive.cgka_ops_for_doc(&doc).await.is_none(),
+            "the document is still in memory"
         );
 
-        let after =
-            KeyhiveAccess::<Local>::event_hashes_for_agent(&keyhive, me).await?;
-        assert_eq!(after, served, "serving loaded the evicted document");
-        assert!(keyhive.has_document(doc).await);
+        let after = KeyhiveAccess::<Local>::event_hashes_for_agent(&keyhive, me).await?;
+        assert_eq!(after, served);
+        assert_eq!(
+            KeyhiveAccess::<Local>::all_agent_events(&keyhive, &BTreeSet::new())
+                .await?
+                .agent_hashes[&me.to_bytes()],
+            served
+        );
+        assert_eq!(KeyhiveAccess::<Local>::total_ops(&keyhive).await?, count);
+        assert!(
+            !keyhive.has_document(doc).await && keyhive.cgka_ops_for_doc(&doc).await.is_none(),
+            "serving loaded the evicted document"
+        );
 
         // Ingesting an operation of an unloaded document loads it rather than
         // leaving the operation pending on a document keyhive reports as absent.
         keyhive.evict(doc).await;
         let encoded: Vec<EventBytes> = ops
             .iter()
-            .map(|op| encode_value(&StaticEvent::<[u8; 32]>::CgkaOperation(Box::new(op.signed().as_ref().clone()))))
+            .map(|op| {
+                encode_value(&StaticEvent::<[u8; 32]>::CgkaOperation(Box::new(
+                    op.signed().as_ref().clone(),
+                )))
+            })
             .collect();
         let not_ingested = KeyhiveAccess::<Local>::ingest_events(&keyhive, encoded).await?;
         assert_eq!(not_ingested, NotIngested::default());

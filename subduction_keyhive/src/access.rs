@@ -12,7 +12,10 @@ use alloc::{
 use future_form::FutureForm;
 use keyhive_crypto::identifier::Identifier;
 
-use crate::message::{EventBytes, EventHash};
+use crate::{
+    message::{EventBytes, EventHash},
+    peer_id::KeyhivePeerId,
+};
 
 /// The 32 bytes of an agent's identifier.
 pub type AgentId = [u8; 32];
@@ -97,11 +100,16 @@ pub trait KeyhiveAccess<F: FutureForm> {
 
     /// Ingest events in any order, returning the ones not ingested.
     ///
+    /// `from` is the peer that sent them, or `None` for events that did not
+    /// arrive from a peer (storage recovery). An implementation that tells
+    /// other peers what it learned uses it to not tell the source back.
+    ///
     /// Events that do not decode are skipped and returned as
     /// [`NotIngested::undecodable`]. An implementation may instead fail the
     /// whole call on them.
     fn ingest_events(
         &self,
+        from: Option<&KeyhivePeerId>,
         events: Vec<EventBytes>,
     ) -> F::Future<'_, Result<NotIngested, Self::Error>>;
 

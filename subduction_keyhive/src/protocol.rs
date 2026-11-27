@@ -707,7 +707,7 @@ where
             "handling sync response"
         );
 
-        let advanced = self.ingest_and_compare(&found_events).await?;
+        let advanced = self.ingest_and_compare(Some(&sender_id), &found_events).await?;
         let outcome = MessageOutcome {
             ingested: advanced,
             confirmed: false,
@@ -796,7 +796,7 @@ where
             .lock()
             .await
             .end_round(&sender_id);
-        let advanced = self.ingest_and_compare(&ops).await?;
+        let advanced = self.ingest_and_compare(Some(&sender_id), &ops).await?;
         let outcome = MessageOutcome {
             ingested: advanced,
             confirmed,
@@ -1011,13 +1011,14 @@ where
     /// Ingest `events`, returning whether keyhive's op count changed.
     async fn ingest_and_compare<B: AsRef<[u8]>>(
         &self,
+        from: Option<&KeyhivePeerId>,
         events: &[B],
     ) -> Result<bool, KeyhiveProtocolError<K, Conn, Async>> {
         if events.is_empty() {
             return Ok(false);
         }
         let total_before = self.total_ops().await?;
-        self.ingest_events(events).await?;
+        self.ingest_events(from, events).await?;
         Ok(self.total_ops().await? != total_before)
     }
 
@@ -1029,12 +1030,14 @@ where
     /// it, the other events are ingested and persisted before the call fails.
     async fn ingest_events<B: AsRef<[u8]>>(
         &self,
+        from: Option<&KeyhivePeerId>,
         event_bytes_list: &[B],
     ) -> Result<(), KeyhiveProtocolError<K, Conn, Async>> {
         let not_ingested = {
             let keyhive = self.keyhive.lock().await;
             keyhive
                 .ingest_events(
+                    from,
                     event_bytes_list
                         .iter()
                         .map(|b| b.as_ref().to_vec())
@@ -1155,7 +1158,7 @@ where
 
         if !event_bytes_list.is_empty() {
             let retry_pending = keyhive
-                .ingest_events(event_bytes_list.iter().map(|b| b.to_vec()).collect())
+                .ingest_events(None, event_bytes_list.iter().map(|b| b.to_vec()).collect())
                 .await
                 .map_err(storage_ops::event_ingestion_error)?
                 .pending;
@@ -1895,7 +1898,7 @@ mod tests {
             event_bytes.len()
         );
 
-        protocol.ingest_events(&event_bytes).await.unwrap();
+        protocol.ingest_events(None, &event_bytes).await.unwrap();
 
         let archives = crate::storage_ops::load_archives::<_, Local>(&storage)
             .await
@@ -2129,7 +2132,7 @@ mod tests {
             let storage = ArchiveTestStorage::new(OnSaveArchive::Refuse);
             let protocol = protocol(&alice_kh, parts, storage.clone());
 
-            protocol.ingest_events(&batch).await?;
+            protocol.ingest_events(None, &batch).await?;
 
             let saved = storage_ops::load_event_bytes::<_, Local>(&storage.inner).await?;
             assert_eq!(
@@ -2154,7 +2157,7 @@ mod tests {
             });
             let protocol = protocol(&alice_kh, parts, storage.clone());
 
-            let first = protocol.ingest_events(&batch);
+            let first = protocol.ingest_events(None, &batch);
             let second = async {
                 entered.recv().await?;
                 // The Keyhive changes while the first archive is being saved,
@@ -2167,7 +2170,7 @@ mod tests {
                     release.send(()).await
                 };
                 let (ingested, released) =
-                    futures::join!(protocol.ingest_events(&batch), release_later);
+                    futures::join!(protocol.ingest_events(None, &batch), release_later);
                 released?;
                 ingested?;
                 TestResult::Ok(())
@@ -2219,7 +2222,7 @@ mod tests {
         let event_bytes: Vec<Arc<[u8]>> = pair.values().map(Dupe::dupe).collect();
         assert!(!event_bytes.is_empty());
 
-        protocol.ingest_events(&event_bytes).await.unwrap();
+        protocol.ingest_events(None, &event_bytes).await.unwrap();
 
         let archives = crate::storage_ops::load_archives::<_, Local>(&storage)
             .await
@@ -2266,7 +2269,7 @@ mod tests {
         event_bytes.push(Arc::from(&b"not an event"[..]));
 
         assert!(matches!(
-            protocol.ingest_events(&event_bytes).await,
+            protocol.ingest_events(None, &event_bytes).await,
             Err(ProtocolError::UndecodableEvents { .. })
         ));
 
@@ -2345,7 +2348,7 @@ mod tests {
             keyhive_peer_id(&dst_off),
             dst_off.generate_contact_card().await?.to_bytes(),
         );
-        proto_off.ingest_events(&ops_off).await?;
+        proto_off.ingest_events(None, &ops_off).await?;
         assert!(
             !dst_off.pending_event_hashes().await.is_empty(),
             "CGKA ops without their certificates should pend"
@@ -2368,7 +2371,7 @@ mod tests {
             dst_on.generate_contact_card().await?.to_bytes(),
         )
         .with_storage_recovery();
-        proto_on.ingest_events(&ops_on).await?;
+        proto_on.ingest_events(None, &ops_on).await?;
         assert!(
             dst_on.has_document(doc_on).await,
             "with recovery on, a pending event must reload the certificates"
@@ -3152,6 +3155,7 @@ mod tests {
 
         let not_ingested = KeyhiveAccess::<Local>::ingest_events(
             &make_keyhive().await,
+            None,
             alice_hashes.values().map(|bytes| bytes.to_vec()).collect(),
         )
         .await
@@ -4315,5 +4319,87 @@ mod protocol_behavioural {
             "carol's syncpoint should be invalidated: alice ingested new \
              ops so total_ops advanced and all stale syncpoints are cleared"
         );
+    }
+}
+
+#[cfg(all(test, feature = "test-utils"))]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::missing_panics_doc)]
+mod ingest_source {
+    use alloc::sync::Arc;
+
+    use async_lock::Mutex;
+    use future_form::Local;
+
+    use super::*;
+    use crate::{
+        storage::MemoryKeyhiveStorage,
+        test_utils::{
+            ChannelConnection, RecordingKeyhive, create_channel_pair,
+            create_group_with_read_members, exchange_all_contact_cards, keyhive_peer_id,
+            make_keyhive,
+        },
+    };
+
+    type Proto = KeyhiveProtocol<RecordingKeyhive, ChannelConnection, MemoryKeyhiveStorage, Local>;
+
+    /// Events a peer sent reach the access with that peer as their source, in both directions of
+    /// a round: the responder's events in the requester's `SyncResponse` handling, and the
+    /// requester's in the responder's `SyncOps` handling.
+    #[tokio::test(flavor = "current_thread")]
+    async fn ingested_events_name_the_peer_that_sent_them() {
+        let alice = make_keyhive().await;
+        let bob = make_keyhive().await;
+        exchange_all_contact_cards(&[&alice, &bob]).await;
+        let (alice_id, bob_id) = (keyhive_peer_id(&alice), keyhive_peer_id(&bob));
+        // Alice has events for Bob; Bob has events for Alice.
+        create_group_with_read_members(&alice, &[&bob_id]).await;
+        create_group_with_read_members(&bob, &[&alice_id]).await;
+        let (alice_card, bob_card) = (
+            alice.generate_contact_card().await.unwrap().to_bytes(),
+            bob.generate_contact_card().await.unwrap().to_bytes(),
+        );
+        let (alice, bob) = (RecordingKeyhive::new(alice), RecordingKeyhive::new(bob));
+        let (alice_seen, bob_seen) = (Arc::clone(&alice.sources), Arc::clone(&bob.sources));
+        let (alice_conn, bob_conn) = create_channel_pair(alice_id.clone(), &bob_id);
+        let alice_proto = Proto::new(
+            Arc::new(Mutex::new(alice)),
+            MemoryKeyhiveStorage::new(),
+            alice_id.clone(),
+            alice_card,
+        );
+        let bob_proto = Proto::new(
+            Arc::new(Mutex::new(bob)),
+            MemoryKeyhiveStorage::new(),
+            bob_id.clone(),
+            bob_card,
+        );
+        alice_proto.add_peer(bob_id.clone(), alice_conn.clone()).await;
+        bob_proto.add_peer(alice_id.clone(), bob_conn.clone()).await;
+
+        alice_proto.sync_keyhive(Some(&bob_id)).await.unwrap();
+        // deliver until both directions are quiet
+        loop {
+            let mut moved = false;
+            while let Ok(message) = bob_conn.inbound_rx.try_recv() {
+                bob_proto
+                    .handle_message(&alice_id, message, None)
+                    .await
+                    .unwrap();
+                moved = true;
+            }
+            while let Ok(message) = alice_conn.inbound_rx.try_recv() {
+                alice_proto
+                    .handle_message(&bob_id, message, None)
+                    .await
+                    .unwrap();
+                moved = true;
+            }
+            if !moved {
+                break;
+            }
+        }
+
+        assert_eq!(*alice_seen.lock().unwrap(), vec![Some(bob_id)]);
+        assert_eq!(*bob_seen.lock().unwrap(), vec![Some(alice_id)]);
     }
 }

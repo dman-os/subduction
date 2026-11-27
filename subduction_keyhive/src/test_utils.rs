@@ -4,7 +4,8 @@ use alloc::{sync::Arc, vec, vec::Vec};
 
 use async_channel::{Receiver, Sender};
 use async_lock::Mutex;
-use future_form::Local;
+use alloc::collections::{BTreeMap, BTreeSet};
+use future_form::{FutureForm, Local};
 use futures::{FutureExt, future::LocalBoxFuture};
 use keyhive_content::store::memory::MemoryCiphertextStore;
 use keyhive_core::{
@@ -17,6 +18,8 @@ use keyline_memory::MemoryKeyline;
 use rand::rngs::OsRng;
 
 use crate::{
+    access::{AgentEventIndex, ArchiveBytes, KeyhiveAccess, NotIngested, Undecodable},
+    message::{EventBytes, EventHash},
     connection::KeyhiveConnection,
     peer_id::KeyhivePeerId,
     protocol::{KeyhiveProtocol, MessageOutcome},
@@ -361,4 +364,109 @@ pub async fn create_group_with_read_members(
             .expect("add_member");
     }
     group_id
+}
+
+/// A [`SimpleKeyhive`] that remembers who each ingest came from, for tests of what the protocol
+/// tells its keyhive.
+#[derive(Clone)]
+pub struct RecordingKeyhive {
+    pub inner: SimpleKeyhive,
+    /// The `from` of every [`KeyhiveAccess::ingest_events`] call, in order.
+    pub sources: Arc<std::sync::Mutex<Vec<Option<KeyhivePeerId>>>>,
+}
+
+impl RecordingKeyhive {
+    /// Wrap `inner`.
+    pub fn new(inner: SimpleKeyhive) -> Self {
+        Self {
+            inner,
+            sources: Arc::default(),
+        }
+    }
+}
+
+impl dupe::Dupe for RecordingKeyhive {}
+
+impl KeyhiveAccess<Local> for RecordingKeyhive {
+    type Error = <SimpleKeyhive as KeyhiveAccess<Local>>::Error;
+
+    fn total_ops(&self) -> <Local as FutureForm>::Future<'_, Result<u64, Self::Error>> {
+        KeyhiveAccess::<Local>::total_ops(&self.inner)
+    }
+
+    fn pending_event_hashes(
+        &self,
+    ) -> <Local as FutureForm>::Future<'_, Result<Vec<EventHash>, Self::Error>> {
+        KeyhiveAccess::<Local>::pending_event_hashes(&self.inner)
+    }
+
+    fn is_known_agent(
+        &self,
+        id: Identifier,
+    ) -> <Local as FutureForm>::Future<'_, Result<bool, Self::Error>> {
+        KeyhiveAccess::<Local>::is_known_agent(&self.inner, id)
+    }
+
+    fn events_for_agent<'a>(
+        &'a self,
+        id: Identifier,
+        within: Option<&'a BTreeSet<EventHash>>,
+    ) -> <Local as FutureForm>::Future<'a, Result<BTreeMap<EventHash, EventBytes>, Self::Error>>
+    {
+        KeyhiveAccess::<Local>::events_for_agent(&self.inner, id, within)
+    }
+
+    fn event_hashes_for_agent(
+        &self,
+        id: Identifier,
+    ) -> <Local as FutureForm>::Future<'_, Result<BTreeSet<EventHash>, Self::Error>> {
+        KeyhiveAccess::<Local>::event_hashes_for_agent(&self.inner, id)
+    }
+
+    fn all_agent_events<'a>(
+        &'a self,
+        skip: &'a BTreeSet<EventHash>,
+    ) -> <Local as FutureForm>::Future<'a, Result<AgentEventIndex, Self::Error>> {
+        KeyhiveAccess::<Local>::all_agent_events(&self.inner, skip)
+    }
+
+    fn sign_bytes(
+        &self,
+        payload: Vec<u8>,
+    ) -> <Local as FutureForm>::Future<'_, Result<Vec<u8>, Self::Error>> {
+        KeyhiveAccess::<Local>::sign_bytes(&self.inner, payload)
+    }
+
+    fn ingest_events(
+        &self,
+        from: Option<&KeyhivePeerId>,
+        events: Vec<EventBytes>,
+    ) -> <Local as FutureForm>::Future<'_, Result<NotIngested, Self::Error>> {
+        self.sources.lock().unwrap().push(from.cloned());
+        KeyhiveAccess::<Local>::ingest_events(&self.inner, from, events)
+    }
+
+    fn receive_contact_card<'a>(
+        &'a self,
+        card: &'a [u8],
+    ) -> <Local as FutureForm>::Future<'a, Result<EventBytes, Self::Error>> {
+        KeyhiveAccess::<Local>::receive_contact_card(&self.inner, card)
+    }
+
+    fn to_archive(
+        &self,
+    ) -> <Local as FutureForm>::Future<'_, Result<ArchiveBytes, Self::Error>> {
+        KeyhiveAccess::<Local>::to_archive(&self.inner)
+    }
+
+    fn is_current_archive(&self, archive: &[u8]) -> Result<bool, Self::Error> {
+        KeyhiveAccess::<Local>::is_current_archive(&self.inner, archive)
+    }
+
+    fn ingest_archive<'a>(
+        &'a self,
+        archive: &'a [u8],
+    ) -> <Local as FutureForm>::Future<'a, Result<Result<(), Undecodable>, Self::Error>> {
+        KeyhiveAccess::<Local>::ingest_archive(&self.inner, archive)
+    }
 }

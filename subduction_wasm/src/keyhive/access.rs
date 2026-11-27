@@ -447,6 +447,7 @@ impl KeyhiveAccess<Local> for WasmKeyhive {
 
     fn ingest_events(
         &self,
+        _from: Option<&subduction_keyhive::KeyhivePeerId>,
         events: Vec<EventBytes>,
     ) -> <Local as FutureForm>::Future<'_, AccessResult<NotIngested>> {
         // `ingestEvents` throws on an event that does not decode, so nothing

@@ -224,6 +224,7 @@ where
 
     fn ingest_events(
         &self,
+        _from: Option<&crate::peer_id::KeyhivePeerId>,
         events: Vec<EventBytes>,
     ) -> F::Future<'_, Result<NotIngested, NativeKeyhiveError<K::Error>>> {
         F::from_future(async move {
@@ -407,7 +408,7 @@ mod tests {
                 )))
             })
             .collect();
-        let not_ingested = KeyhiveAccess::<Local>::ingest_events(&keyhive, encoded).await?;
+        let not_ingested = KeyhiveAccess::<Local>::ingest_events(&keyhive, None, encoded).await?;
         assert_eq!(not_ingested, NotIngested::default());
         assert!(keyhive.has_document(doc).await);
         Ok(())

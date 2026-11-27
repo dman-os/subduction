@@ -247,7 +247,7 @@ where
     Async: FutureForm,
 {
     let not_ingested = keyhive
-        .ingest_events(events)
+        .ingest_events(None, events)
         .await
         .map_err(event_ingestion_error)?;
     for bytes in &not_ingested.undecodable {

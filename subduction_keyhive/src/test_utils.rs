@@ -243,6 +243,7 @@ const fn either(a: MessageOutcome, b: MessageOutcome) -> MessageOutcome {
     MessageOutcome {
         ingested: a.ingested || b.ingested,
         confirmed: a.confirmed || b.confirmed,
+        answered: a.answered || b.answered,
     }
 }
 

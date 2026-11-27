@@ -100,6 +100,14 @@ pub struct MessageOutcome {
     /// `SyncOps`. Rounds in which this side sent no events are not reported
     /// and neither is a sync check that determines the two sides are in sync.
     pub confirmed: bool,
+
+    /// The frame was the `SyncResponse` to a round this side started with
+    /// [`KeyhiveProtocol::sync_keyhive`] or [`KeyhiveProtocol::sync_with_peer`] in
+    /// [`SyncMode::Full`], and its events are ingested (they are durable if the access is). The
+    /// peer's reply has landed, so the round is over from this side. A
+    /// [`SyncMode::Check`] round has no reply to wait for when the two sides are in sync, so
+    /// it never reports this.
+    pub answered: bool,
 }
 
 /// Keyhive sync protocol handler.
@@ -127,6 +135,8 @@ where
     ///
     /// False by default. Enable it with [`Self::with_storage_recovery`].
     attempt_storage_recovery: bool,
+    /// The peers a request is out to: a round this side started that the peer has not answered.
+    requested: Mutex<Set<KeyhivePeerId>>,
     syncpoints: Mutex<SyncpointMap>,
     awaiting_confirmation: Mutex<AwaitingConfirmation>,
     cache: Mutex<PeriodicEventCache>,
@@ -172,6 +182,7 @@ where
             contact_card,
             archive_config: None,
             attempt_storage_recovery: false,
+            requested: Mutex::new(Set::new()),
             syncpoints: Mutex::new(SyncpointMap::new()),
             awaiting_confirmation: Mutex::new(AwaitingConfirmation::new()),
             cache: Mutex::new(PeriodicEventCache::new()),
@@ -207,6 +218,7 @@ where
     /// awaiting confirmation.
     pub async fn remove_peer(&self, peer_id: &KeyhivePeerId) {
         self.syncpoints.lock().await.remove(peer_id);
+        self.requested.lock().await.remove(peer_id);
         self.awaiting_confirmation.lock().await.remove(peer_id);
         self.peers.lock().await.remove(peer_id);
     }
@@ -388,7 +400,7 @@ where
                     "sending sync request"
                 );
 
-                self.sign_and_send(target_id, message, false).await?;
+                self.send_request(target_id, message, false).await?;
             } else {
                 tracing::debug!(
                     target = %target_id,
@@ -400,7 +412,7 @@ where
                     target_id: target_id.clone(),
                 };
 
-                self.sign_and_send(target_id, message, true).await?;
+                self.send_request(target_id, message, true).await?;
             }
         }
 
@@ -512,8 +524,12 @@ where
                 .await
                 .map(|()| MessageOutcome::default()),
             Message::SyncResponse { .. } => {
-                self.handle_sync_response(message, cached_sender_pair.as_deref())
-                    .await
+                let sender = message.sender_id().clone();
+                let mut outcome = self
+                    .handle_sync_response(message, cached_sender_pair.as_deref())
+                    .await?;
+                outcome.answered = self.requested.lock().await.remove(&sender);
+                Ok(outcome)
             }
             Message::SyncOps { .. } => self.handle_sync_ops(message).await,
             Message::RequestContactCard { .. } => self
@@ -561,6 +577,7 @@ where
                 Ok(MessageOutcome {
                     ingested: false,
                     confirmed,
+                    answered: false,
                 })
             }
         }
@@ -711,6 +728,7 @@ where
         let outcome = MessageOutcome {
             ingested: advanced,
             confirmed: false,
+            answered: false,
         };
 
         // Send requested ops.
@@ -800,6 +818,7 @@ where
         let outcome = MessageOutcome {
             ingested: advanced,
             confirmed,
+            answered: false,
         };
 
         // Send confirmation after ingesting ops.
@@ -895,6 +914,21 @@ where
     }
 
     /// Sign a message and send it to a peer.
+    /// Send a request that starts a round, and remember that `target` owes an answer.
+    async fn send_request(
+        &self,
+        target: &KeyhivePeerId,
+        message: Message,
+        include_contact_card: bool,
+    ) -> Result<(), KeyhiveProtocolError<K, Conn, Async>> {
+        self.requested.lock().await.insert(target.clone());
+        let sent = self.sign_and_send(target, message, include_contact_card).await;
+        if sent.is_err() {
+            self.requested.lock().await.remove(target);
+        }
+        sent
+    }
+
     async fn sign_and_send(
         &self,
         target_peer_id: &KeyhivePeerId,
@@ -3461,10 +3495,24 @@ mod tests {
         let ingested_and_confirmed = MessageOutcome {
             ingested: true,
             confirmed: true,
+            answered: false,
         };
         for (expected_at_bob, expected_at_alice) in [
-            (ingested_and_confirmed, ingested_and_confirmed),
-            (MessageOutcome::default(), MessageOutcome::default()),
+            // the starter (bob) is also told that its request was answered
+            (
+                MessageOutcome {
+                    answered: true,
+                    ..ingested_and_confirmed
+                },
+                ingested_and_confirmed,
+            ),
+            (
+                MessageOutcome {
+                    answered: true,
+                    ..MessageOutcome::default()
+                },
+                MessageOutcome::default(),
+            ),
         ] {
             let (at_bob, at_alice) = run_sync_round(
                 &bob_proto,
@@ -4515,5 +4563,108 @@ mod persistence_failure {
     #[tokio::test(flavor = "current_thread")]
     async fn an_access_that_is_durable_by_itself_needs_no_storage() {
         assert!(bob_receives(NoStorage).await.unwrap().ingested);
+    }
+}
+
+#[cfg(all(test, feature = "test-utils"))]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::missing_panics_doc)]
+mod round_completion {
+    use alloc::sync::Arc;
+
+    use async_lock::Mutex;
+    use future_form::Local;
+
+    use super::*;
+    use crate::{
+        storage::MemoryKeyhiveStorage,
+        test_utils::{
+            ChannelConnection, SimpleKeyhive, create_channel_pair, create_group_with_read_members,
+            exchange_all_contact_cards, keyhive_peer_id, make_keyhive,
+        },
+    };
+
+    type Proto = KeyhiveProtocol<SimpleKeyhive, ChannelConnection, MemoryKeyhiveStorage, Local>;
+
+    /// Alice and Bob, who know each other, with events on both sides.
+    async fn pair() -> (Proto, Proto, ChannelConnection, ChannelConnection) {
+        let alice = make_keyhive().await;
+        let bob = make_keyhive().await;
+        exchange_all_contact_cards(&[&alice, &bob]).await;
+        let (alice_id, bob_id) = (keyhive_peer_id(&alice), keyhive_peer_id(&bob));
+        create_group_with_read_members(&alice, &[&bob_id]).await;
+        create_group_with_read_members(&bob, &[&alice_id]).await;
+        let (alice_card, bob_card) = (
+            alice.generate_contact_card().await.unwrap().to_bytes(),
+            bob.generate_contact_card().await.unwrap().to_bytes(),
+        );
+        let (alice_conn, bob_conn) = create_channel_pair(alice_id.clone(), &bob_id);
+        let alice_proto = Proto::new(
+            Arc::new(Mutex::new(alice)),
+            MemoryKeyhiveStorage::new(),
+            alice_id.clone(),
+            alice_card,
+        );
+        let bob_proto = Proto::new(
+            Arc::new(Mutex::new(bob)),
+            MemoryKeyhiveStorage::new(),
+            bob_id.clone(),
+            bob_card,
+        );
+        alice_proto.add_peer(bob_id, alice_conn.clone()).await;
+        bob_proto.add_peer(alice_id, bob_conn.clone()).await;
+        (alice_proto, bob_proto, alice_conn, bob_conn)
+    }
+
+    /// Deliver until quiet, returning how many frames answered a round at Alice and at Bob.
+    async fn deliver(
+        alice: &Proto,
+        bob: &Proto,
+        alice_conn: &ChannelConnection,
+        bob_conn: &ChannelConnection,
+    ) -> (usize, usize) {
+        let (alice_id, bob_id) = (alice.peer_id(), bob.peer_id());
+        let (mut at_alice, mut at_bob) = (0, 0);
+        loop {
+            let mut moved = false;
+            while let Ok(message) = bob_conn.inbound_rx.try_recv() {
+                let outcome = bob.handle_message(&alice_id, message, None).await.unwrap();
+                at_bob += usize::from(outcome.answered);
+                moved = true;
+            }
+            while let Ok(message) = alice_conn.inbound_rx.try_recv() {
+                let outcome = alice.handle_message(&bob_id, message, None).await.unwrap();
+                at_alice += usize::from(outcome.answered);
+                moved = true;
+            }
+            if !moved {
+                return (at_alice, at_bob);
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_full_round_is_answered_once_at_its_starter_and_never_at_the_peer() {
+        let (alice, bob, alice_conn, bob_conn) = pair().await;
+        let bob_id = bob.peer_id();
+
+        alice.sync_with_peer(&bob_id, SyncMode::Full).await.unwrap();
+        assert_eq!(deliver(&alice, &bob, &alice_conn, &bob_conn).await, (1, 0));
+
+        // a later round is answered again, and a frame nobody asked for is not an answer
+        alice.sync_with_peer(&bob_id, SyncMode::Full).await.unwrap();
+        assert_eq!(deliver(&alice, &bob, &alice_conn, &bob_conn).await, (1, 0));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_peer_that_disconnects_owes_no_answer() {
+        let (alice, bob, alice_conn, bob_conn) = pair().await;
+        let bob_id = bob.peer_id();
+
+        alice.sync_with_peer(&bob_id, SyncMode::Full).await.unwrap();
+        alice.remove_peer(&bob_id).await;
+        alice.add_peer(bob_id, alice_conn.clone()).await;
+
+        // bob still answers the request, but alice no longer awaits it
+        assert_eq!(deliver(&alice, &bob, &alice_conn, &bob_conn).await, (0, 0));
     }
 }

@@ -45,6 +45,10 @@ pub type Connections<Conn, Async> = Arc<Mutex<Map<Session, NonEmpty<Authenticate
 pub trait OutcomeObserver {
     /// Called with the outcome of a frame on `session`.
     fn on_outcome(&self, session: Session, outcome: MessageOutcome);
+
+    /// Called when handling a frame on `session` failed. A round the peer owed an answer to
+    /// will not be answered by this frame.
+    fn on_failure(&self, _session: Session) {}
 }
 
 impl OutcomeObserver for () {
@@ -359,14 +363,20 @@ impl<Async: FutureForm, K, Store, Conn, Obs> Handler<Async, Conn>
                 .protocols
                 .get(&session.local())
                 .ok_or(UnknownPrincipal(session.local()))?;
-            let outcome = protocol
+            let handled = protocol
                 .handle_message(
                     &keyhive_peer(session.remote()),
                     signed,
                     Some(self.peer_connections(session)),
                 )
-                .await
-                .map_err(HandleError::Protocol)?;
+                .await;
+            let outcome = match handled {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    self.observer.on_failure(session);
+                    return Err(HandleError::Protocol(error));
+                }
+            };
             self.observer.on_outcome(session, outcome);
             Ok(())
         })

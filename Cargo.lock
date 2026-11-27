@@ -5461,6 +5461,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "subduction_composed"
+version = "0.1.0"
+dependencies = [
+ "future_form",
+ "futures",
+ "sedimentree_core",
+ "subduction_core",
+ "subduction_ephemeral",
+ "subduction_keyhive",
+ "thiserror 2.0.20",
+ "tokio",
+]
+
+[[package]]
 name = "subduction_core"
 version = "0.21.0"
 dependencies = [

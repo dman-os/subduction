@@ -1,0 +1,31 @@
+[package]
+name = "subduction_composed"
+version = "0.1.0"
+description = "One wire envelope and one handler for the sync, keyhive and ephemeral protocols on a Subduction connection"
+
+categories = ["web-programming"]
+keywords = ["sync", "subduction"]
+
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+future_form = { workspace = true }
+futures = { workspace = true }
+sedimentree_core = { workspace = true }
+subduction_core = { workspace = true }
+subduction_ephemeral = { workspace = true }
+subduction_keyhive = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+subduction_core = { workspace = true, features = ["std", "test_utils"] }
+tokio = { workspace = true, features = ["rt", "macros"] }
+
+[features]
+default = []
+std = ["subduction_core/std"]
+
+[lints]
+workspace = true

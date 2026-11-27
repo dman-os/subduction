@@ -294,3 +294,50 @@ mod tests {
         assert!(StorageHash::from_hex(invalid).is_none());
     }
 }
+
+/// A storage that keeps nothing, for a [`KeyhiveAccess`](crate::KeyhiveAccess) that owns its
+/// durability.
+///
+/// [`KeyhiveProtocol`](crate::KeyhiveProtocol) saves what it ingests through its storage after
+/// the keyhive has applied it. A keyhive that commits an ingest to a database of its own before
+/// `ingest_events` returns has nothing left to save, and a second copy of its events would only
+/// disagree with its own. It reads back nothing, so storage recovery finds nothing to replay.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoStorage;
+
+#[future_form::future_form(Sendable, Local)]
+impl<Async: FutureForm> KeyhiveStorage<Async> for NoStorage {
+    type Error = Infallible;
+
+    fn save_archive(
+        &self,
+        _hash: StorageHash,
+        _data: Vec<u8>,
+    ) -> Async::Future<'_, Result<(), Self::Error>> {
+        Async::from_future(async { Ok(()) })
+    }
+
+    fn load_archives(&self) -> Async::Future<'_, Result<Vec<(StorageHash, Vec<u8>)>, Self::Error>> {
+        Async::from_future(async { Ok(Vec::new()) })
+    }
+
+    fn delete_archive(&self, _hash: StorageHash) -> Async::Future<'_, Result<(), Self::Error>> {
+        Async::from_future(async { Ok(()) })
+    }
+
+    fn save_event(
+        &self,
+        _hash: StorageHash,
+        _data: Vec<u8>,
+    ) -> Async::Future<'_, Result<(), Self::Error>> {
+        Async::from_future(async { Ok(()) })
+    }
+
+    fn load_events(&self) -> Async::Future<'_, Result<Vec<(StorageHash, Vec<u8>)>, Self::Error>> {
+        Async::from_future(async { Ok(Vec::new()) })
+    }
+
+    fn delete_event(&self, _hash: StorageHash) -> Async::Future<'_, Result<(), Self::Error>> {
+        Async::from_future(async { Ok(()) })
+    }
+}

@@ -59,7 +59,7 @@ pub use native::NativeKeyhiveError;
 pub use peer_id::KeyhivePeerId;
 pub use protocol::{KeyhiveProtocol, KeyhiveProtocolError, MessageOutcome, SyncMode};
 pub use signed_message::{SignedMessage, VerifiedMessage};
-pub use storage::{KeyhiveStorage, MemoryKeyhiveStorage, StorageHash};
+pub use storage::{KeyhiveStorage, MemoryKeyhiveStorage, NoStorage, StorageHash};
 pub use storage_ops::{
     compact, hash_event_bytes, ingest_from_storage, load_archives, load_event_bytes,
     save_event_bytes, save_keyhive_archive,

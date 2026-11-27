@@ -100,6 +100,10 @@ pub trait KeyhiveAccess<F: FutureForm> {
 
     /// Ingest events in any order, returning the ones not ingested.
     ///
+    /// When this returns `Ok`, an access that persists its own state has made the events durable:
+    /// the protocol saves them to its [`KeyhiveStorage`](crate::KeyhiveStorage) afterwards, and an
+    /// access that is durable by itself pairs with [`NoStorage`](crate::NoStorage).
+    ///
     /// `from` is the peer that sent them, or `None` for events that did not
     /// arrive from a peer (storage recovery). An implementation that tells
     /// other peers what it learned uses it to not tell the source back.

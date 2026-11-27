@@ -1067,28 +1067,6 @@ where
             .filter(|bytes| !undecodable.contains(bytes))
             .collect();
 
-        let pending = not_ingested.pending;
-        if !pending.is_empty() {
-            if self.attempt_storage_recovery {
-                tracing::warn!(
-                    count = pending.len(),
-                    "events pending after ingestion, attempting storage recovery"
-                );
-
-                if let Err(e) = self.try_storage_recovery(&decoded).await {
-                    tracing::warn!(
-                        error = %e,
-                        "storage recovery failed"
-                    );
-                }
-            } else {
-                tracing::warn!(
-                    count = pending.len(),
-                    "events pending after ingestion; storage recovery disabled"
-                );
-            }
-        }
-
         let use_archive = self
             .archive_config
             .filter(|(threshold, _)| decoded.len() > *threshold);
@@ -1103,11 +1081,25 @@ where
 
         if !archived {
             for event_bytes in &decoded {
-                if let Err(e) =
-                    storage_ops::save_event_bytes(&self.storage, event_bytes.to_vec()).await
-                {
-                    tracing::warn!(error = %e, "failed to persist event to storage");
-                }
+                // The events are applied in memory already, so a failed save is an error the
+                // caller sees: a keyhive that is ahead of its storage must not look healthy.
+                storage_ops::save_event_bytes(&self.storage, event_bytes.to_vec()).await?;
+            }
+        }
+
+        let pending = not_ingested.pending;
+        if !pending.is_empty() {
+            if self.attempt_storage_recovery {
+                tracing::warn!(
+                    count = pending.len(),
+                    "events pending after ingestion, attempting storage recovery"
+                );
+                self.try_storage_recovery(&decoded).await?;
+            } else {
+                tracing::warn!(
+                    count = pending.len(),
+                    "events pending after ingestion; storage recovery disabled"
+                );
             }
         }
 
@@ -1190,9 +1182,8 @@ where
                 .map_err(ProtocolError::ReceiveContactCard)?
         };
 
-        if let Err(e) = storage_ops::save_event_bytes(&self.storage, event).await {
-            tracing::error!(error = %e, "failed to save contact card op to storage. Card will be lost on restart");
-        }
+        // A card that is not durable would be lost on restart: fail the message.
+        storage_ops::save_event_bytes(&self.storage, event).await?;
 
         tracing::debug!("ingested contact card");
         Ok(())
@@ -4401,5 +4392,128 @@ mod ingest_source {
 
         assert_eq!(*alice_seen.lock().unwrap(), vec![Some(bob_id)]);
         assert_eq!(*bob_seen.lock().unwrap(), vec![Some(alice_id)]);
+    }
+}
+
+#[cfg(all(test, feature = "test-utils"))]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::missing_panics_doc)]
+mod persistence_failure {
+    use alloc::sync::Arc;
+
+    use async_lock::Mutex;
+    use future_form::Local;
+    use futures::{FutureExt, future::LocalBoxFuture};
+
+    use super::*;
+    use crate::{
+        error::StorageError,
+        storage::{MemoryKeyhiveStorage, NoStorage},
+        test_utils::{
+            ChannelConnection, SimpleKeyhive, create_channel_pair, create_group_with_read_members,
+            exchange_all_contact_cards, keyhive_peer_id, make_keyhive,
+        },
+    };
+
+    /// A storage that refuses every save.
+    #[derive(Debug, Clone, Copy)]
+    struct Refusing;
+
+    impl KeyhiveStorage<Local> for Refusing {
+        type Error = StorageError;
+
+        fn save_archive(
+            &self,
+            _: StorageHash,
+            _: Vec<u8>,
+        ) -> LocalBoxFuture<'_, Result<(), Self::Error>> {
+            async { Err(StorageError::Save("refused".into())) }.boxed_local()
+        }
+
+        fn load_archives(
+            &self,
+        ) -> LocalBoxFuture<'_, Result<Vec<(StorageHash, Vec<u8>)>, Self::Error>> {
+            async { Ok(Vec::new()) }.boxed_local()
+        }
+
+        fn delete_archive(&self, _: StorageHash) -> LocalBoxFuture<'_, Result<(), Self::Error>> {
+            async { Ok(()) }.boxed_local()
+        }
+
+        fn save_event(
+            &self,
+            _: StorageHash,
+            _: Vec<u8>,
+        ) -> LocalBoxFuture<'_, Result<(), Self::Error>> {
+            async { Err(StorageError::Save("refused".into())) }.boxed_local()
+        }
+
+        fn load_events(
+            &self,
+        ) -> LocalBoxFuture<'_, Result<Vec<(StorageHash, Vec<u8>)>, Self::Error>> {
+            async { Ok(Vec::new()) }.boxed_local()
+        }
+
+        fn delete_event(&self, _: StorageHash) -> LocalBoxFuture<'_, Result<(), Self::Error>> {
+            async { Ok(()) }.boxed_local()
+        }
+    }
+
+    /// Alice has a group for Bob; Bob's round request gets the events back, and what Bob does
+    /// with them is decided by `storage`. Returns the result of handling the response.
+    async fn bob_receives<S>(storage: S) -> Result<MessageOutcome, ()>
+    where
+        S: KeyhiveStorage<Local> + 'static,
+    {
+        let alice = make_keyhive().await;
+        let bob = make_keyhive().await;
+        exchange_all_contact_cards(&[&alice, &bob]).await;
+        let (alice_id, bob_id) = (keyhive_peer_id(&alice), keyhive_peer_id(&bob));
+        create_group_with_read_members(&alice, &[&bob_id]).await;
+        let (alice_card, bob_card) = (
+            alice.generate_contact_card().await.unwrap().to_bytes(),
+            bob.generate_contact_card().await.unwrap().to_bytes(),
+        );
+        let (alice_conn, bob_conn) = create_channel_pair(alice_id.clone(), &bob_id);
+        let alice_proto = KeyhiveProtocol::<
+            SimpleKeyhive,
+            ChannelConnection,
+            MemoryKeyhiveStorage,
+            Local,
+        >::new(
+            Arc::new(Mutex::new(alice)),
+            MemoryKeyhiveStorage::new(),
+            alice_id.clone(),
+            alice_card,
+        );
+        let bob_proto = KeyhiveProtocol::<SimpleKeyhive, ChannelConnection, S, Local>::new(
+            Arc::new(Mutex::new(bob)),
+            storage,
+            bob_id.clone(),
+            bob_card,
+        );
+        alice_proto.add_peer(bob_id.clone(), alice_conn.clone()).await;
+        bob_proto.add_peer(alice_id.clone(), bob_conn.clone()).await;
+
+        bob_proto.sync_keyhive(Some(&alice_id)).await.unwrap();
+        let request = alice_conn.inbound_rx.recv().await.unwrap();
+        alice_proto
+            .handle_message(&bob_id, request, None)
+            .await
+            .unwrap();
+        let response = bob_conn.inbound_rx.recv().await.unwrap();
+        bob_proto
+            .handle_message(&alice_id, response, None)
+            .await
+            .map_err(|_| ())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_save_that_fails_fails_the_message() {
+        assert!(bob_receives(Refusing).await.is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_access_that_is_durable_by_itself_needs_no_storage() {
+        assert!(bob_receives(NoStorage).await.unwrap().ingested);
     }
 }

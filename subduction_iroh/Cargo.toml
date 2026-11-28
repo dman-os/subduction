@@ -24,7 +24,6 @@ sedimentree_core = { workspace = true }
 subduction_core = { workspace = true, features = ["system_time"] }
 subduction_crypto = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]

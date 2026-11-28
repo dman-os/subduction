@@ -3170,6 +3170,14 @@ where
             async_channel::Receiver<DispatchOutcome<Conn, Async, Hdl::HandlerError>>,
         ) = async_channel::unbounded();
 
+        // The last ordered message queued for each session: the next one waits on it. Ordering
+        // is decided here, at the one place that sees messages in the order they arrived,
+        // because the tasks spawned below start in no guaranteed order.
+        let mut ordered_tails: alloc::collections::BTreeMap<
+            Session,
+            futures::channel::oneshot::Receiver<()>,
+        > = alloc::collections::BTreeMap::new();
+
         // Dispatch admission is per-peer, enforced upstream in the connection
         // manager (a reader acquires its peer's permit before forwarding); the
         // listener just drains the queue and spawns.
@@ -3194,6 +3202,7 @@ where
                                 );
 
                                 if self.remove_connection(&conn).await == Some(true) {
+                                    ordered_tails.remove(&conn.session());
                                     handler.on_peer_disconnect(conn.session()).await;
                                 }
                                 tracing::debug!(peer = %peer_id, "removed failed connection");
@@ -3250,6 +3259,7 @@ where
                         let peer_id = conn.peer_id();
                         tracing::warn!(conn = %conn_id, peer = %peer_id, "connection closed, removing");
                         if self.remove_connection(&conn).await == Some(true) {
+                            ordered_tails.remove(&conn.session());
                             handler.on_peer_disconnect(conn.session()).await;
                         }
                     } else {
@@ -3303,6 +3313,14 @@ where
                         #[cfg(feature = "metrics")]
                         crate::metrics::dispatch_inflight_inc();
 
+                        let order = if handler.is_ordered(&msg) {
+                            let (done, finished) = futures::channel::oneshot::channel();
+                            let after = ordered_tails.insert(conn.session(), finished);
+                            DispatchOrder { after, done: Some(done) }
+                        } else {
+                            DispatchOrder::default()
+                        };
+
                         self.spawner.spawn(Async::dispatch_task(
                             Arc::clone(&self),
                             handler.clone(),
@@ -3311,6 +3329,7 @@ where
                             propagate,
                             done_tx.clone(),
                             permit,
+                            order,
                         ));
                     } else {
                         tracing::info!("SyncMessage queue closed");
@@ -3697,6 +3716,16 @@ pub type DocSyncResult<Async, Store, Conn, WireMsg> = (
     >,
 );
 
+/// How a dispatch task is sequenced against the other ordered messages of its session (see
+/// [`Handler::is_ordered`]): it waits for `after`, which resolves (or is cancelled) when the
+/// previous ordered message has been handled, and drops `done` when it is handled itself. An
+/// unordered message has neither.
+#[derive(Debug, Default)]
+pub struct DispatchOrder {
+    after: Option<futures::channel::oneshot::Receiver<()>>,
+    done: Option<futures::channel::oneshot::Sender<()>>,
+}
+
 /// The completion outcome a spawned dispatch task reports to the listener,
 /// specialized for a handler `Hdl`. A module-local alias (like [`DocSyncResult`])
 /// so the `#[future_form]` macro can name it in the generated signatures.
@@ -3880,6 +3909,7 @@ pub trait NodeTasks<
         propagate: Option<(SedimentreeId, PeerId)>,
         sender: async_channel::Sender<DispatchOutcomeFor<Conn, Self, Hdl>>,
         permit: SemaphoreGuardArc,
+        order: DispatchOrder,
     ) -> Self::Future<'static, ()>;
 
     /// Construct the detached task that forwards an inbound subscribe to
@@ -4088,11 +4118,22 @@ where
         propagate: Option<(SedimentreeId, PeerId)>,
         sender: async_channel::Sender<DispatchOutcomeFor<Conn, Self, Hdl>>,
         permit: SemaphoreGuardArc,
+        order: DispatchOrder,
     ) -> Self::Future<'static, ()> {
         Async::from_future(async move {
             let _permit = permit;
+            let DispatchOrder { after, done } = order;
+            // Dropping `done` (when this task ends, however it ends) starts the next ordered
+            // message of the session.
+            let _done = done;
 
             let mut completion = DispatchCompletion::new(sender);
+
+            if let Some(previous) = after {
+                // The previous ordered message of this session reports by dropping its sender,
+                // so a cancelled receive is the signal and not a failure.
+                previous.await.ok();
+            }
 
             // We need to hold the inbound subscription here, before we've run
             // the fetch, then forward the subscription after the fetch

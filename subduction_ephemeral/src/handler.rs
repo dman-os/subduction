@@ -89,6 +89,9 @@ pub struct EphemeralHandler<
 > {
     /// Inbound subscriptions: which sessions are subscribed to receive ephemeral messages from us.
     ephemeral_subscriptions: Arc<Mutex<Map<Topic, Set<Session>>>>,
+    /// Inbound subscriptions the policy refused, which [`reevaluate`](Self::reevaluate) judges
+    /// again when the rule's answer may have changed.
+    refused_subscriptions: Arc<Mutex<Map<Topic, Set<Session>>>>,
     /// Outbound subscriptions: sedimentree IDs we want to receive ephemeral messages for.
     outgoing_subscriptions: Arc<Mutex<Set<Topic>>>,
     connections: Arc<Mutex<Map<Session, NonEmpty<Authenticated<Conn, Async>>>>>,
@@ -129,6 +132,7 @@ impl<
     fn clone(&self) -> Self {
         Self {
             ephemeral_subscriptions: self.ephemeral_subscriptions.clone(),
+            refused_subscriptions: self.refused_subscriptions.clone(),
             outgoing_subscriptions: self.outgoing_subscriptions.clone(),
             connections: self.connections.clone(),
             policy: self.policy.clone(),
@@ -171,6 +175,7 @@ impl<Async: FutureForm, Conn: Clone + 'static, E: EphemeralPolicy<Async>, Clk: C
 
         let handler = Self {
             ephemeral_subscriptions: Arc::new(Mutex::new(Map::new())),
+            refused_subscriptions: Arc::new(Mutex::new(Map::new())),
             outgoing_subscriptions: Arc::new(Mutex::new(Set::new())),
             connections,
             policy,
@@ -314,6 +319,56 @@ impl<Async: FutureForm, Conn: Clone + 'static, E: EphemeralPolicy<Async>, Clk: C
 
         let msg = EphemeralMessage::Subscribe { topics };
         self.send_to_all_peers(&msg).await;
+    }
+
+    /// Judge again the inbound subscriptions to `topics` that the policy refused, and admit the
+    /// ones it now allows.
+    ///
+    /// A subscription is judged when it arrives, and the policy's answer can move afterwards (a
+    /// grant that had not reached us yet). The owner of the rule calls this when it learns that
+    /// the answer for some topics may have changed, so that the subscriber does not have to
+    /// subscribe again. Refusals are remembered until the peer unsubscribes or disconnects.
+    pub async fn reevaluate(&self, topics: impl IntoIterator<Item = Topic>) {
+        for topic in topics {
+            let sessions: alloc::vec::Vec<Session> = {
+                let refused = self.refused_subscriptions.lock().await;
+                refused
+                    .get(&topic)
+                    .map(|sessions| sessions.iter().copied().collect())
+                    .unwrap_or_default()
+            };
+            for session in sessions {
+                if self
+                    .policy
+                    .authorize_subscribe(session.remote(), topic)
+                    .await
+                    .is_err()
+                {
+                    continue;
+                }
+                // Taken out of the refused set first: an unsubscribe that arrived while the
+                // policy was being asked has already removed it, and then there is nothing to
+                // admit.
+                let still_refused = {
+                    let mut refused = self.refused_subscriptions.lock().await;
+                    let held = refused
+                        .get_mut(&topic)
+                        .is_some_and(|sessions| sessions.remove(&session));
+                    if refused.get(&topic).is_some_and(Set::is_empty) {
+                        refused.remove(&topic);
+                    }
+                    held
+                };
+                if still_refused {
+                    self.ephemeral_subscriptions
+                        .lock()
+                        .await
+                        .entry(topic)
+                        .or_default()
+                        .insert(session);
+                }
+            }
+        }
     }
 
     /// Unsubscribe from ephemeral messages for the given topics.
@@ -483,6 +538,13 @@ impl<Async: FutureForm, Conn, E, Clk, Sp> Handler<Async, Conn>
         })
     }
 
+    /// A subscription change is ordered: a peer that unsubscribes and then subscribes to the
+    /// same topic must end up subscribed, and handled the other way round it ends up not.
+    /// Publications stay concurrent.
+    fn is_ordered(&self, message: &EphemeralMessage) -> bool {
+        !matches!(message, EphemeralMessage::Ephemeral(_))
+    }
+
     fn on_peer_disconnect(&self, session: Session) -> Async::Future<'_, ()> {
         Async::from_future(async move {
             let mut subs = self.ephemeral_subscriptions.lock().await;
@@ -490,6 +552,14 @@ impl<Async: FutureForm, Conn, E, Clk, Sp> Handler<Async, Conn>
                 sessions.remove(&session);
                 !sessions.is_empty()
             });
+            drop(subs);
+            self.refused_subscriptions
+                .lock()
+                .await
+                .retain(|_id, sessions| {
+                    sessions.remove(&session);
+                    !sessions.is_empty()
+                });
 
             // The nonce cache is per remote peer: another session of the same
             // peer shares its replay window, so keep it while one is open.
@@ -806,6 +876,14 @@ impl<
             }
         }
 
+        // 2b. Remember what was refused, for `reevaluate`.
+        if !rejected.is_empty() {
+            let mut refused = self.refused_subscriptions.lock().await;
+            for topic in &rejected {
+                refused.entry(*topic).or_default().insert(conn.session());
+            }
+        }
+
         if let Some(rejected) = NonEmpty::from_vec(rejected) {
             let msg = EphemeralMessage::SubscribeRejected { topics: rejected };
             if let Err(e) = conn.send(&msg).await {
@@ -822,12 +900,19 @@ impl<
     async fn recv_unsubscribe(&self, conn: &Authenticated<Conn, Async>, topics: NonEmpty<Topic>) {
         let session = conn.session();
         let mut subs = self.ephemeral_subscriptions.lock().await;
+        let mut refused = self.refused_subscriptions.lock().await;
 
         for topic in &topics {
             if let Some(peers) = subs.get_mut(topic) {
                 peers.remove(&session);
                 if peers.is_empty() {
                     subs.remove(topic);
+                }
+            }
+            if let Some(peers) = refused.get_mut(topic) {
+                peers.remove(&session);
+                if peers.is_empty() {
+                    refused.remove(topic);
                 }
             }
         }

@@ -1962,3 +1962,116 @@ async fn publish_no_subscribers_is_noop() -> TestResult {
 
     Ok(())
 }
+
+/// A policy whose answer the test flips while the handler runs, standing in for a rule that
+/// depends on state that moves (a grant arriving late).
+mod switch_policy {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    use future_form::{FutureForm, Sendable};
+    use subduction_core::peer::id::PeerId;
+    use subduction_ephemeral::{policy::EphemeralPolicy, topic::Topic};
+
+    use super::deny_policy::Denied;
+
+    #[derive(Debug, Clone, Default)]
+    pub(super) struct Switch(pub(super) Arc<AtomicBool>);
+
+    impl Switch {
+        fn allowed(&self) -> Result<(), Denied> {
+            if self.0.load(Ordering::SeqCst) {
+                Ok(())
+            } else {
+                Err(Denied)
+            }
+        }
+    }
+
+    impl EphemeralPolicy<Sendable> for Switch {
+        type SubscribeDisallowed = Denied;
+        type PublishDisallowed = Denied;
+
+        fn authorize_subscribe(
+            &self,
+            _peer: PeerId,
+            _id: Topic,
+        ) -> <Sendable as FutureForm>::Future<'_, Result<(), Self::SubscribeDisallowed>> {
+            Sendable::from_future(async { self.allowed() })
+        }
+
+        fn authorize_publish(
+            &self,
+            _peer: PeerId,
+            _id: Topic,
+        ) -> <Sendable as FutureForm>::Future<'_, Result<(), Self::PublishDisallowed>> {
+            Sendable::from_future(async { self.allowed() })
+        }
+
+        fn filter_authorized_subscribers(
+            &self,
+            _id: Topic,
+            peers: Vec<PeerId>,
+        ) -> <Sendable as FutureForm>::Future<'_, Vec<PeerId>> {
+            Sendable::from_future(async move {
+                if self.allowed().is_ok() { peers } else { Vec::new() }
+            })
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_refused_subscription_is_admitted_when_reevaluated_after_the_policy_allows_it()
+-> TestResult {
+    let switch = switch_policy::Switch::default();
+    let connections: Connections = Arc::new(Mutex::new(Map::new()));
+    let (handler, _rx) = EphemeralHandler::new(
+        connections.clone(),
+        switch.clone(),
+        EphemeralConfig::default(),
+        FakeClock::new(TimestampSeconds::new(1_000)),
+        TokioSpawn,
+    );
+    let handler = Arc::new(handler);
+    let (auth, handle) = register_peer(&connections, peer(1)).await;
+    let topic = Topic::new([0xAA; 32]);
+    handler
+        .handle(&auth, EphemeralMessage::Subscribe { topics: NonEmpty::new(topic) })
+        .await?;
+    let refused =
+        tokio::time::timeout(Duration::from_millis(100), handle.outbound_rx.recv()).await??;
+    assert!(matches!(refused, EphemeralMessage::SubscribeRejected { .. }));
+
+    // still refused: reevaluating does nothing while the rule says no
+    handler.reevaluate([topic]).await;
+    let signer = make_signer();
+    let first = make_signed_ephemeral(&signer, topic, b"early".to_vec()).await;
+    handler.publish(first).await;
+    assert!(handle.outbound_rx.try_recv().is_err(), "a refused peer is sent nothing");
+
+    // the rule now allows it: reevaluating admits it, and it is sent what is published next
+    switch.0.store(true, core::sync::atomic::Ordering::SeqCst);
+    handler.reevaluate([topic]).await;
+    let second = make_signed_ephemeral(&signer, topic, b"late".to_vec()).await;
+    handler.publish(second).await;
+    let heard =
+        tokio::time::timeout(Duration::from_millis(100), handle.outbound_rx.recv()).await??;
+    assert!(matches!(heard, EphemeralMessage::Ephemeral(_)));
+
+    // an unsubscribe forgets a refusal, so reevaluating does not bring it back
+    let other = Topic::new([0xBB; 32]);
+    switch.0.store(false, core::sync::atomic::Ordering::SeqCst);
+    handler
+        .handle(&auth, EphemeralMessage::Subscribe { topics: NonEmpty::new(other) })
+        .await?;
+    handle.outbound_rx.recv().await?;
+    handler
+        .handle(&auth, EphemeralMessage::Unsubscribe { topics: NonEmpty::new(other) })
+        .await?;
+    switch.0.store(true, core::sync::atomic::Ordering::SeqCst);
+    handler.reevaluate([other]).await;
+    let third = make_signed_ephemeral(&signer, other, b"never".to_vec()).await;
+    handler.publish(third).await;
+    assert!(handle.outbound_rx.try_recv().is_err(), "an unsubscribed topic stays unsubscribed");
+    Ok(())
+}

@@ -141,6 +141,14 @@ where
         })
     }
 
+    fn is_ordered(&self, message: &Wire) -> bool {
+        match message {
+            Wire::Sync(message) => self.sync.is_ordered(message),
+            Wire::Keyhive(message) => self.keyhive.is_ordered(message),
+            Wire::Ephemeral(message) => self.ephemeral.is_ordered(message),
+        }
+    }
+
     fn on_peer_disconnect(&self, session: Session) -> Async::Future<'_, ()> {
         Async::from_future(async move {
             self.sync.on_peer_disconnect(session).await;

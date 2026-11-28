@@ -121,6 +121,22 @@ pub trait Handler<Async: FutureForm, Conn: Clone> {
         message: Self::Message,
     ) -> Async::Future<'a, Result<(), Self::HandlerError>>;
 
+    /// Whether `message` must be handled in the order it arrived relative to the other
+    /// ordered messages of its connection.
+    ///
+    /// The listen loop dispatches each inbound message as a task of its own, so messages of
+    /// one connection are otherwise handled concurrently and may finish (or even start
+    /// their effects) in any order. A handler whose messages are state changes that only
+    /// make sense in sequence, such as an unsubscribe followed by a subscribe to the same
+    /// topic, answers `true` for them: the listener then starts each ordered message of a
+    /// connection only after the previous ordered message of that connection has been
+    /// handled. Unordered messages are not delayed by, and do not delay, ordered ones.
+    ///
+    /// The default is `false`, which is the listener's behaviour for every message.
+    fn is_ordered(&self, _message: &Self::Message) -> bool {
+        false
+    }
+
     /// Called when a session's last connection drops.
     ///
     /// Use this hook to clean up per-peer state such as subscription
